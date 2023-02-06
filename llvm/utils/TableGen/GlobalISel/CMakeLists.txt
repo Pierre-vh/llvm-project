@@ -12,4 +12,6 @@ add_llvm_library(LLVMTableGenGlobalISel STATIC DISABLE_LLVM_LINK_LLVM_DYLIB
                  GIMatchDagPredicate.cpp
                  GIMatchDagPredicateDependencyEdge.cpp
                  GIMatchTree.cpp
+                 MIRPatterns.cpp
+                 MIRPatternsGen.cpp
                 )

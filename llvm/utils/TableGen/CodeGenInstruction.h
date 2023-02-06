@@ -158,6 +158,7 @@ namespace llvm {
     bool isPredicable;
     bool hasOptionalDef;
     bool isVariadic;
+    bool hasVariadicOuts;
 
     // Provide transparent accessors to the operand list.
     bool empty() const { return OperandList.empty(); }

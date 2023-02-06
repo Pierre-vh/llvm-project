@@ -17,6 +17,8 @@
 #include "GlobalISel/GIMatchDag.h"
 #include "GlobalISel/GIMatchDagPredicate.h"
 #include "GlobalISel/GIMatchTree.h"
+#include "GlobalISel/MIRPatterns.h"
+#include "GlobalISel/MIRPatternsGen.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringSet.h"
@@ -49,9 +51,13 @@ static cl::opt<bool> StopAfterParse(
     "gicombiner-stop-after-parse",
     cl::desc("Stop processing after parsing rules and dump state"),
     cl::cat(GICombinerEmitterCat));
-static cl::opt<bool> StopAfterBuild(
-    "gicombiner-stop-after-build",
-    cl::desc("Stop processing after building the match tree"),
+static cl::opt<bool>
+    StopAfterBuild("gicombiner-stop-after-build",
+                   cl::desc("Stop processing after building the match tree"),
+                   cl::cat(GICombinerEmitterCat));
+static cl::opt<bool> DumpParsedMIRPatterns(
+    "gicombiner-mir-patterns-dump-parse",
+    cl::desc("Dumps the structure of GI MIR patterns after parsing them"),
     cl::cat(GICombinerEmitterCat));
 
 namespace {
@@ -113,7 +119,6 @@ public:
 
 class CombineRule {
 public:
-
   using const_matchdata_iterator = std::vector<MatchDataInfo>::const_iterator;
 
   struct VarInfo {
@@ -152,6 +157,11 @@ protected:
   /// A block of arbitrary C++ to finish testing the match.
   /// FIXME: This is a temporary measure until we have actual pattern matching
   const StringInit *MatchingFixupCode = nullptr;
+
+  const StringInit *ApplyCode = nullptr;
+
+  std::unique_ptr<MIRPattern> MatchMIRPat = nullptr;
+  std::unique_ptr<MIRPattern> ApplyMIRPat = nullptr;
 
   /// The MatchData defined by the match stage and required by the apply stage.
   /// This allows the plumbing of arbitrary data from C++ predicates between the
@@ -195,13 +205,22 @@ public:
 
   bool parseDefs();
   bool parseMatcher(const CodeGenTarget &Target);
+  bool parseApply(const CodeGenTarget &Target);
+
+  bool parseMIRCombine(const CodeGenTarget &Target);
+
+  bool isMIRCombine() const { return MatchMIRPat && ApplyMIRPat; }
 
   RuleID getID() const { return ID; }
   unsigned allocUID() { return UID++; }
   StringRef getName() const { return TheDef.getName(); }
   const Record &getDef() const { return TheDef; }
   const StringInit *getMatchingFixupCode() const { return MatchingFixupCode; }
+  const StringInit *getApplyCode() const { return ApplyCode; }
   size_t getNumRoots() const { return Roots.size(); }
+
+  MIRPattern *getMatchMIRPattern() const { return MatchMIRPat.get(); }
+  MIRPattern *getApplyMIRPattern() const { return ApplyMIRPat.get(); }
 
   GIMatchDag &getMatchDag() { return MatchDag; }
   const GIMatchDag &getMatchDag() const { return MatchDag; }
@@ -327,12 +346,13 @@ static const DagInit *getDagWithOperatorOfSubClass(const Init &N,
 }
 
 StringRef makeNameForAnonInstr(CombineRule &Rule) {
-  return insertStrTab(to_string(
-      format("__anon%" PRIu64 "_%u", Rule.getID(), Rule.allocUID())));
+  return insertStrTab(
+      to_string(format("__anon%" PRIu64 "_%u", Rule.getID(), Rule.allocUID())));
 }
 
 StringRef makeDebugName(CombineRule &Rule, StringRef Name) {
-  return insertStrTab(Name.empty() ? makeNameForAnonInstr(Rule) : StringRef(Name));
+  return insertStrTab(Name.empty() ? makeNameForAnonInstr(Rule)
+                                   : StringRef(Name));
 }
 
 StringRef makeNameForAnonPredicate(CombineRule &Rule) {
@@ -373,8 +393,7 @@ bool CombineRule::parseDefs() {
 
     // Otherwise emit an appropriate error message.
     if (getDefOfSubClass(*Defs->getArg(I), "GIDefKind"))
-      PrintError(TheDef.getLoc(),
-                 "This GIDefKind not implemented in tablegen");
+      PrintError(TheDef.getLoc(), "This GIDefKind not implemented in tablegen");
     else if (getDefOfSubClass(*Defs->getArg(I), "GIDefKindWithArgs"))
       PrintError(TheDef.getLoc(),
                  "This GIDefKindWithArgs not implemented in tablegen");
@@ -512,7 +531,6 @@ bool CombineRule::parseMatcher(const CodeGenTarget &Target) {
                                    *Matchers->getArg(I)))
       continue;
 
-
     // Parse arbitrary C++ code we have in lieu of supporting MIR matching
     if (const StringInit *StringI = dyn_cast<StringInit>(Matchers->getArg(I))) {
       assert(!MatchingFixupCode &&
@@ -543,8 +561,8 @@ bool CombineRule::parseMatcher(const CodeGenTarget &Target) {
     const auto &Uses = NamedEdgeUses[NameAndDefs.getKey()];
     for (const VarInfo &DefVar : NameAndDefs.getValue()) {
       for (const VarInfo &UseVar : Uses) {
-        MatchDag.addEdge(insertStrTab(NameAndDefs.getKey()), UseVar.N, UseVar.Op,
-                         DefVar.N, DefVar.Op);
+        MatchDag.addEdge(insertStrTab(NameAndDefs.getKey()), UseVar.N,
+                         UseVar.Op, DefVar.N, DefVar.Op);
       }
     }
   }
@@ -585,6 +603,75 @@ bool CombineRule::parseMatcher(const CodeGenTarget &Target) {
       }
     }
   }
+  return true;
+}
+
+bool CombineRule::parseApply(const CodeGenTarget &Target) {
+  DagInit *Applyer = TheDef.getValueAsDag("Apply");
+  if (Applyer->getOperatorAsDef(TheDef.getLoc())->getName() != "apply") {
+    PrintError(TheDef.getLoc(), "Expected 'apply' operator in Apply DAG");
+    return false;
+  }
+
+  if (const StringInit *Code = dyn_cast<StringInit>(Applyer->getArg(0))) {
+    ApplyCode = Code;
+    return true;
+  }
+
+  PrintError(TheDef.getLoc(), "Expected apply code block");
+  return false;
+}
+
+bool CombineRule::parseMIRCombine(const CodeGenTarget &Target) {
+  MatchMIRPat = MIRPattern::parse(TheDef.getRecords(), Target,
+                                  TheDef.getValueAsString("MatchMIR"),
+                                  MIRPattern::Kind::Match,
+                                  TheDef.getName() + ".match");
+  if (!MatchMIRPat)
+    return false;
+
+  ApplyMIRPat = MIRPattern::parse(TheDef.getRecords(), Target,
+                                  TheDef.getValueAsString("ApplyMIR"),
+                                  MIRPattern::Kind::Apply,
+                                  TheDef.getName() + ".apply");
+  if (!ApplyMIRPat)
+    return false;
+
+  // The root of the patterns are always their last instruction.
+  MIRPattern::Instruction *MatchRoot = MatchMIRPat->insts_back();
+  MatchMIRPat->setRoot(MatchRoot);
+  if (!MatchMIRPat->verifyReachabilityFromRoot())
+    return false;
+
+  ApplyMIRPat->setRoot(ApplyMIRPat->insts_back());
+  if (!ApplyMIRPat->verifyReachabilityFromRoot())
+    return false;
+
+  // FIXME: Hacked-in
+  {
+    StringRef Name = "";
+    GIMatchDagInstr *N =
+        MatchDag.addInstrNode(makeDebugName(*this, Name), insertStrTab(Name),
+                              MatchDag.getContext().makeEmptyOperandList());
+    N->setMatchRoot();
+
+    const auto &P = MatchDag.addPredicateNode<GIMatchDagOneOfOpcodesPredicate>(
+        makeNameForAnonPredicate(*this));
+    MatchDag.addPredicateDependency(N, nullptr, P, &P->getOperandInfo()["mi"]);
+
+    for (CodeGenInstruction *Opc : MatchRoot->opcodes())
+      P->addOpcode(Opc);
+
+    // Current implementation is hacked-in and uses generated C++ code to do the
+    // bulk of the work.
+    MatchDag.setHasPostMatchPredicate(true);
+  }
+
+  if (DumpParsedMIRPatterns) {
+    MatchMIRPat->print(dbgs());
+    ApplyMIRPat->print(dbgs());
+  }
+
   return true;
 }
 
@@ -653,13 +740,20 @@ void GICombinerEmitter::emitNameMatcher(raw_ostream &OS) const {
 
 std::unique_ptr<CombineRule>
 GICombinerEmitter::makeCombineRule(const Record &TheDef) {
-  std::unique_ptr<CombineRule> Rule =
-      std::make_unique<CombineRule>(Target, MatchDagCtx, NumPatternTotal, TheDef);
+  std::unique_ptr<CombineRule> Rule = std::make_unique<CombineRule>(
+      Target, MatchDagCtx, NumPatternTotal, TheDef);
 
-  if (!Rule->parseDefs())
-    return nullptr;
-  if (!Rule->parseMatcher(Target))
-    return nullptr;
+  if (TheDef.isSubClassOf("GIMIRCombineRule")) {
+    if (!Rule->parseMIRCombine(Target))
+      return nullptr;
+  } else {
+    if (!Rule->parseDefs())
+      return nullptr;
+    if (!Rule->parseMatcher(Target))
+      return nullptr;
+    if (!Rule->parseApply(Target))
+      return nullptr;
+  }
 
   Rule->reorientToRoots();
 
@@ -755,12 +849,10 @@ void GICombinerEmitter::generateCodeForTree(raw_ostream &OS,
     }
     Rule->declareExpansions(Expansions);
 
-    DagInit *Applyer = RuleDef.getValueAsDag("Apply");
-    if (Applyer->getOperatorAsDef(RuleDef.getLoc())->getName() !=
-        "apply") {
-      PrintError(RuleDef.getLoc(), "Expected 'apply' operator in Apply DAG");
-      return;
-    }
+    std::optional<MIRPatternGICombinerGen> MIRPatGen;
+    if (Rule->isMIRCombine())
+      MIRPatGen.emplace(*Rule->getMatchMIRPattern(),
+                        *Rule->getApplyMIRPattern());
 
     OS << Indent << "  if (1\n";
 
@@ -798,8 +890,7 @@ void GICombinerEmitter::generateCodeForTree(raw_ostream &OS,
       if (Predicate->generateCheckCode(OS, (Indent + "      ").str(),
                                        Expansions))
         continue;
-      PrintError(RuleDef.getLoc(),
-                 "Unable to test predicate used in rule");
+      PrintError(RuleDef.getLoc(), "Unable to test predicate used in rule");
       PrintNote(SMLoc(),
                 "This indicates an incomplete implementation in tablegen");
       Predicate->print(errs());
@@ -810,8 +901,12 @@ void GICombinerEmitter::generateCodeForTree(raw_ostream &OS,
       break;
     }
 
-    if (Rule->getMatchingFixupCode() &&
-        !Rule->getMatchingFixupCode()->getValue().empty()) {
+    if (MIRPatGen) {
+      OS << Indent << "      && [&]() {\n";
+      MIRPatGen->emitMatchCode(OS, "MIs[0]", Indent.size() + 10);
+      OS << Indent << "    }()";
+    } else if (Rule->getMatchingFixupCode() &&
+               !Rule->getMatchingFixupCode()->getValue().empty()) {
       // FIXME: Single-use lambda's like this are a serious compile-time
       // performance and memory issue. It's convenient for this early stage to
       // defer some work to successive patches but we need to eliminate this
@@ -829,18 +924,21 @@ void GICombinerEmitter::generateCodeForTree(raw_ostream &OS,
     }
     OS << Indent << "     ) {\n" << Indent << "   ";
 
-    if (const StringInit *Code = dyn_cast<StringInit>(Applyer->getArg(0))) {
-      OS << "    LLVM_DEBUG(dbgs() << \"Applying rule '"
-         << RuleDef.getName()
+    if (const StringInit *Code = Rule->getApplyCode()) {
+      OS << "    LLVM_DEBUG(dbgs() << \"Applying rule '" << RuleDef.getName()
          << "'\\n\");\n"
          << CodeExpander(Code->getAsUnquotedString(), Expansions,
                          RuleDef.getLoc(), ShowExpansions)
          << '\n'
          << Indent << "    return true;\n"
          << Indent << "  }\n";
+    } else if (MIRPatGen) {
+      OS << "    LLVM_DEBUG(dbgs() << \"Applying rule '" << RuleDef.getName()
+         << "'\\n\");\n";
+      MIRPatGen->emitApplyCode(OS, Indent.size() + 4);
+      OS << "\n" << Indent << "    return true;\n" << Indent << "  }\n";
     } else {
-      PrintError(RuleDef.getLoc(), "Expected apply code block");
-      return;
+      llvm_unreachable("No apply code block or MIR Pattern?");
     }
 
     OS << Indent << "}\n";
@@ -851,7 +949,9 @@ void GICombinerEmitter::generateCodeForTree(raw_ostream &OS,
     // trap-door we have to support arbitrary C++ code while we're migrating to
     // the declarative style then we know that subsequent leaves are
     // unreachable.
-    if (Leaf.isFullyTested() &&
+    // TODO: MIRCombines are implemented in terms of matching fixup code for now
+    // so they're also exempt.
+    if (Leaf.isFullyTested() && !Rule->isMIRCombine() &&
         (!Rule->getMatchingFixupCode() ||
          Rule->getMatchingFixupCode()->getValue().empty())) {
       AnyFullyTested = true;
@@ -867,8 +967,8 @@ void GICombinerEmitter::generateCodeForTree(raw_ostream &OS,
 static void emitAdditionalHelperMethodArguments(raw_ostream &OS,
                                                 Record *Combiner) {
   for (Record *Arg : Combiner->getValueAsListOfDefs("AdditionalArguments"))
-    OS << ",\n    " << Arg->getValueAsString("Type")
-       << " " << Arg->getValueAsString("Name");
+    OS << ",\n    " << Arg->getValueAsString("Type") << " "
+       << Arg->getValueAsString("Name");
 }
 
 void GICombinerEmitter::run(raw_ostream &OS) {
@@ -909,8 +1009,9 @@ void GICombinerEmitter::run(raw_ostream &OS) {
 
   Records.startTimer("Emit combiner");
   OS << "#ifdef " << Name.upper() << "_GENCOMBINERHELPER_DEPS\n"
-     << "#include \"llvm/ADT/SparseBitVector.h\"\n"
-     << "namespace llvm {\n"
+     << "#include \"llvm/ADT/SparseBitVector.h\"\n";
+  MIRPatternGICombinerGen::emitIncludeDeps(OS);
+  OS << "namespace llvm {\n"
      << "extern cl::OptionCategory GICombinerOptionCategory;\n"
      << "} // end namespace llvm\n"
      << "#endif // ifdef " << Name.upper() << "_GENCOMBINERHELPER_DEPS\n\n";
@@ -1049,6 +1150,7 @@ void GICombinerEmitter::run(raw_ostream &OS) {
   for (const auto &Rule : Rules)
     for (const auto &I : Rule->matchdata_decls())
       OS << "  " << I.getType() << " " << I.getVariableName() << ";\n";
+  MIRPatternGICombinerGen::emitMatchInfoDecl(OS, 2);
   OS << "\n";
 
   OS << "  int Partition = -1;\n";

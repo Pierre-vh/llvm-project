@@ -47,6 +47,17 @@ class GICombinerHelper<string classname, list<GICombine> rules>
   list<GICombinerHelperArg> AdditionalArguments =
       [GICombinerHelperArg<"CombinerHelper &", "Helper">];
 }
+
+class GIMIRCombineRule<code match, code apply> : GICombine {
+  code MatchMIR = match;
+  code ApplyMIR = apply;
+
+  /// Defines the predicates that are checked before the match function
+  /// is called. Targets can use this to, for instance, check Subtarget
+  /// features.
+  list<Predicate> Predicates = [];
+}
+
 class GICombineRule<dag defs, dag match, dag apply> : GICombine {
   /// Defines the external interface of the match rule. This includes:
   /// * The names of the root nodes (requires at least one)
@@ -98,7 +109,7 @@ def match;
 /// * A subclass of GIMatchKind
 /// * A subclass of GIMatchKindWithArgs
 /// * A subclass of Instruction
-/// * A MIR code block (deprecated)
+/// * A MIR code block
 /// The GIMatchKind and GIMatchKindWithArgs cases are described in more detail
 /// in their definitions below.
 /// For the Instruction case, these are collected into a DAG where operand names
@@ -262,23 +273,44 @@ def undef_to_negative_one: GICombineRule<
          [{ return Helper.matchAnyExplicitUseIsUndef(*${root}); }]),
   (apply [{ Helper.replaceInstWithConstant(*${root}, -1); }])>;
 
+// FIXME: Does not work yet because of overly conservative type constraints checking.
+/*
+def binop_left_undef_to_zero: GIMIRCombineRule<
+  [{
+    %imp = G_IMPLICIT_DEF
+    %root = (G_SHL | G_UDIV | G_UREM) %imp, _
+  }],
+  [{
+    %root = G_CONSTANT i32 0
+  }]
+>;
+*/
+
 def binop_left_undef_to_zero: GICombineRule<
   (defs root:$root),
   (match (wip_match_opcode G_SHL, G_UDIV, G_UREM):$root,
          [{ return Helper.matchOperandIsUndef(*${root}, 1); }]),
   (apply [{ Helper.replaceInstWithConstant(*${root}, 0); }])>;
 
-def binop_right_undef_to_undef: GICombineRule<
-  (defs root:$root),
-  (match (wip_match_opcode G_SHL, G_ASHR, G_LSHR):$root,
-         [{ return Helper.matchOperandIsUndef(*${root}, 2); }]),
-  (apply [{ Helper.replaceInstWithUndef(*${root}); }])>;
+def binop_right_undef_to_undef: GIMIRCombineRule<
+  [{
+    %imp = G_IMPLICIT_DEF
+    %root = (G_SHL | G_ASHR | G_LSHR) _, %imp
+  }],
+  [{
+    %root = G_IMPLICIT_DEF
+  }]
+>;
 
-def unary_undef_to_zero: GICombineRule<
-  (defs root:$root),
-  (match (wip_match_opcode G_ABS):$root,
-         [{ return Helper.matchOperandIsUndef(*${root}, 1); }]),
-  (apply [{ Helper.replaceInstWithConstant(*${root}, 0); }])>;
+def unary_undef_to_zero: GIMIRCombineRule<
+  [{
+    %imp = G_IMPLICIT_DEF
+    %root = G_ABS %imp
+  }],
+  [{
+    %root = G_CONSTANT i32 0
+  }]
+>;
 
 // Instructions where if any source operand is undef, the instruction can be
 // replaced with undef.

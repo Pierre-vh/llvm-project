@@ -26,6 +26,7 @@ CGIOperandList::CGIOperandList(Record *R) : TheDef(R) {
   isPredicable = false;
   hasOptionalDef = false;
   isVariadic = false;
+  hasVariadicOuts = false;
 
   DagInit *OutDI = R->getValueAsDag("OutOperandList");
 
@@ -54,7 +55,6 @@ CGIOperandList::CGIOperandList(Record *R) : TheDef(R) {
   std::set<std::string> OperandNames;
   unsigned e = InDI->getNumArgs() + OutDI->getNumArgs();
   OperandList.reserve(e);
-  bool VariadicOuts = false;
   for (unsigned i = 0; i != e; ++i){
     Init *ArgInit;
     StringRef ArgName;
@@ -113,7 +113,7 @@ CGIOperandList::CGIOperandList(Record *R) : TheDef(R) {
         hasOptionalDef = true;
     } else if (Rec->getName() == "variable_ops") {
       if (i < NumDefs)
-        VariadicOuts = true;
+        hasVariadicOuts = true;
       isVariadic = true;
       continue;
     } else if (Rec->isSubClassOf("RegisterClass")) {
@@ -188,7 +188,7 @@ CGIOperandList::CGIOperandList(Record *R) : TheDef(R) {
     MIOperandNo += NumOps;
   }
 
-  if (VariadicOuts)
+  if (hasVariadicOuts)
     --NumDefs;
 }
 
