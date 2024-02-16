@@ -375,6 +375,8 @@ std::string SDNode::getOperationName(const SelectionDAG *G) const {
   case ISD::FP_TO_UINT_SAT:             return "fp_to_uint_sat";
   case ISD::BITCAST:                    return "bitcast";
   case ISD::ADDRSPACECAST:              return "addrspacecast";
+  case ISD::ADDRSPACECAST_NONNULL:
+    return "addrspacecast_nonnull";
   case ISD::FP16_TO_FP:                 return "fp16_to_fp";
   case ISD::STRICT_FP16_TO_FP:          return "strict_fp16_to_fp";
   case ISD::FP_TO_FP16:                 return "fp_to_fp16";

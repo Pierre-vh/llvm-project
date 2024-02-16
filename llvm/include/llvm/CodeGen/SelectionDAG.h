@@ -1592,7 +1592,7 @@ public:
 
   /// Return an AddrSpaceCastSDNode.
   SDValue getAddrSpaceCast(const SDLoc &dl, EVT VT, SDValue Ptr, unsigned SrcAS,
-                           unsigned DestAS);
+                           unsigned DestAS, bool NonNull = false);
 
   /// Return a freeze using the SDLoc of the value operand.
   SDValue getFreeze(SDValue V);

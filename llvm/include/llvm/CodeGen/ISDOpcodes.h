@@ -905,6 +905,10 @@ enum NodeType {
   /// ADDRSPACECAST - This operator converts between pointers of different
   /// address spaces.
   ADDRSPACECAST,
+  /// ADDRSPACECAST_NONNULL is identical to ADDRSPACECAST but the input
+  /// operand is known to never be null, and the target is free to omit
+  /// special null-pointer handling code.
+  ADDRSPACECAST_NONNULL,
 
   /// FP16_TO_FP, FP_TO_FP16 - These operators are used to perform promotions
   /// and truncation for half-precision (16 bit) floating numbers. These nodes

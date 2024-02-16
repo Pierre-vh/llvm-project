@@ -2341,7 +2341,8 @@ SDValue SelectionDAG::getBitcast(EVT VT, SDValue V) {
 }
 
 SDValue SelectionDAG::getAddrSpaceCast(const SDLoc &dl, EVT VT, SDValue Ptr,
-                                       unsigned SrcAS, unsigned DestAS) {
+                                       unsigned SrcAS, unsigned DestAS,
+                                       bool NonNull) {
   SDValue Ops[] = {Ptr};
   FoldingSetNodeID ID;
   AddNodeIDNode(ID, ISD::ADDRSPACECAST, getVTList(VT), Ops);
@@ -2353,7 +2354,7 @@ SDValue SelectionDAG::getAddrSpaceCast(const SDLoc &dl, EVT VT, SDValue Ptr,
     return SDValue(E, 0);
 
   auto *N = newSDNode<AddrSpaceCastSDNode>(dl.getIROrder(), dl.getDebugLoc(),
-                                           VT, SrcAS, DestAS);
+                                           VT, SrcAS, DestAS, NonNull);
   createOperands(N, Ops);
 
   CSEMap.InsertNode(N, IP);
@@ -11781,8 +11782,9 @@ GlobalAddressSDNode::GlobalAddressSDNode(unsigned Opc, unsigned Order,
 
 AddrSpaceCastSDNode::AddrSpaceCastSDNode(unsigned Order, const DebugLoc &dl,
                                          EVT VT, unsigned SrcAS,
-                                         unsigned DestAS)
-    : SDNode(ISD::ADDRSPACECAST, Order, dl, getSDVTList(VT)),
+                                         unsigned DestAS, bool NonNull)
+    : SDNode(NonNull ? ISD::ADDRSPACECAST_NONNULL : ISD::ADDRSPACECAST, Order,
+             dl, getSDVTList(VT)),
       SrcAddrSpace(SrcAS), DestAddrSpace(DestAS) {}
 
 MemSDNode::MemSDNode(unsigned Opc, unsigned Order, const DebugLoc &dl,

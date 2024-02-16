@@ -1281,13 +1281,15 @@ private:
 
 public:
   AddrSpaceCastSDNode(unsigned Order, const DebugLoc &dl, EVT VT,
-                      unsigned SrcAS, unsigned DestAS);
+                      unsigned SrcAS, unsigned DestAS, bool NonNull);
 
   unsigned getSrcAddressSpace() const { return SrcAddrSpace; }
   unsigned getDestAddressSpace() const { return DestAddrSpace; }
+  bool isNonNull() const { return getOpcode() == ISD::ADDRSPACECAST_NONNULL; }
 
   static bool classof(const SDNode *N) {
-    return N->getOpcode() == ISD::ADDRSPACECAST;
+    return N->getOpcode() == ISD::ADDRSPACECAST ||
+           N->getOpcode() == ISD::ADDRSPACECAST_NONNULL;
   }
 };
 

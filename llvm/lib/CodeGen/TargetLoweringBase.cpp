@@ -866,6 +866,10 @@ void TargetLoweringBase::initActions() {
     // Most backends expect to see the node which just returns the value loaded.
     setOperationAction(ISD::ATOMIC_CMP_SWAP_WITH_SUCCESS, VT, Expand);
 
+    // ADDRSPACECAST_NONNULL is lowered back to ADDRSPACECAST unless the target
+    // opts-in to support it.
+    setOperationAction(ISD::ADDRSPACECAST_NONNULL, VT, Expand);
+
     // These operations default to expand.
     setOperationAction({ISD::FGETSIGN,       ISD::CONCAT_VECTORS,
                         ISD::FMINNUM,        ISD::FMAXNUM,

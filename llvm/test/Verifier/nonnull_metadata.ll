@@ -8,8 +8,8 @@ define void @test_not_pointer(ptr %p) {
   ret void
 }
 
-; CHECK: nonnull applies only to load instructions, use attributes for calls or invokes
-define void @test_not_load() {
+; CHECK: nonnull applies only to load/addrspacecast instructions, use attributes for calls or invokes
+define void @test_invalid() {
   call ptr @dummy(), !nonnull !{}
   ret void
 }

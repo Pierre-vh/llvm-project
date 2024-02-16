@@ -1030,6 +1030,7 @@ void SelectionDAGLegalize::LegalizeOp(SDNode *Node) {
   case ISD::LLROUND:
   case ISD::LRINT:
   case ISD::LLRINT:
+  case ISD::ADDRSPACECAST_NONNULL:
     Action = TLI.getOperationAction(Node->getOpcode(),
                                     Node->getOperand(0).getValueType());
     break;
@@ -3386,6 +3387,14 @@ bool SelectionDAGLegalize::ExpandNode(SDNode *Node) {
   case ISD::FP_TO_UINT_SAT:
     Results.push_back(TLI.expandFP_TO_INT_SAT(Node, DAG));
     break;
+  case ISD::ADDRSPACECAST_NONNULL: {
+    // Expand back to a normal ADDRSPACECAST.
+    const auto *ASC = cast<AddrSpaceCastSDNode>(Node);
+    Results.push_back(DAG.getAddrSpaceCast(
+        dl, ASC->getValueType(0), ASC->getOperand(0), ASC->getSrcAddressSpace(),
+        ASC->getDestAddressSpace(), /*NonNull*/ false));
+    break;
+  }
   case ISD::VAARG:
     Results.push_back(DAG.expandVAArg(Node));
     Results.push_back(Results[0].getValue(1));

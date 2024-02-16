@@ -3779,9 +3779,12 @@ void SelectionDAGBuilder::visitAddrSpaceCast(const User &I) {
 
   unsigned SrcAS = SV->getType()->getPointerAddressSpace();
   unsigned DestAS = I.getType()->getPointerAddressSpace();
+  bool HasNonNull =
+      (bool)cast<Instruction>(I).getMetadata(LLVMContext::MD_nonnull);
 
   if (!TM.isNoopAddrSpaceCast(SrcAS, DestAS))
-    N = DAG.getAddrSpaceCast(getCurSDLoc(), DestVT, N, SrcAS, DestAS);
+    N = DAG.getAddrSpaceCast(getCurSDLoc(), DestVT, N, SrcAS, DestAS,
+                             HasNonNull);
 
   setValue(&I, N);
 }
