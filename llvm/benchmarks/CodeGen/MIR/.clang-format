@@ -1,0 +1,5 @@
+# GoogleBench uses a lot of macros and clang-format's line breaking doesn't deal well with them.
+# Disable line breaking so we can still format the code while going over the 80 column limit
+# when it makes sense.
+BasedOnStyle: LLVM
+ColumnLimit: 0

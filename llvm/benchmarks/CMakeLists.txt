@@ -1,4 +1,2 @@
-set(LLVM_LINK_COMPONENTS
-  Support)
-
-add_benchmark(DummyYAML DummyYAML.cpp)
+add_subdirectory(CodeGen)
+add_subdirectory(Support)
