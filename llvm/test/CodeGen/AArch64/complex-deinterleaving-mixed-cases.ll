@@ -46,17 +46,17 @@ define <4 x float> @add_mul(<4 x float> %a, <4 x float> %b, <4 x float> %c) {
 ; CHECK-NEXT:    fsub v1.4s, v1.4s, v2.4s
 ; CHECK-NEXT:    ext v3.16b, v2.16b, v2.16b, #8
 ; CHECK-NEXT:    ext v4.16b, v0.16b, v0.16b, #8
-; CHECK-NEXT:    ext v5.16b, v1.16b, v1.16b, #8
-; CHECK-NEXT:    zip2 v0.2s, v0.2s, v4.2s
-; CHECK-NEXT:    zip2 v4.2s, v2.2s, v3.2s
-; CHECK-NEXT:    zip1 v1.2s, v1.2s, v5.2s
+; CHECK-NEXT:    zip2 v5.2s, v2.2s, v3.2s
 ; CHECK-NEXT:    zip1 v2.2s, v2.2s, v3.2s
-; CHECK-NEXT:    fmul v5.2s, v4.2s, v0.2s
-; CHECK-NEXT:    fmul v3.2s, v1.2s, v4.2s
-; CHECK-NEXT:    fneg v4.2s, v5.2s
-; CHECK-NEXT:    fmla v3.2s, v0.2s, v2.2s
-; CHECK-NEXT:    fmla v4.2s, v1.2s, v2.2s
-; CHECK-NEXT:    zip1 v0.4s, v4.4s, v3.4s
+; CHECK-NEXT:    zip2 v0.2s, v0.2s, v4.2s
+; CHECK-NEXT:    ext v4.16b, v1.16b, v1.16b, #8
+; CHECK-NEXT:    zip1 v1.2s, v1.2s, v4.2s
+; CHECK-NEXT:    fmul v4.2s, v5.2s, v0.2s
+; CHECK-NEXT:    fmul v5.2s, v1.2s, v5.2s
+; CHECK-NEXT:    fneg v3.2s, v4.2s
+; CHECK-NEXT:    fmla v5.2s, v0.2s, v2.2s
+; CHECK-NEXT:    fmla v3.2s, v1.2s, v2.2s
+; CHECK-NEXT:    zip1 v0.4s, v3.4s, v5.4s
 ; CHECK-NEXT:    ret
 entry:
   %0 = fsub fast <4 x float> %b, %c

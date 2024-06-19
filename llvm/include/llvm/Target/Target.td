@@ -214,6 +214,17 @@ class Register<string n, list<string> altNames = []> {
   // covered by its sub-register AX.
   bit CoveredBySubRegs = false;
 
+  // Whether this register has to be a RegUnit root of its own in order to
+  // accurately represent its liveness.
+  //
+  // This is needed in some cases to work around how Register Units are
+  // represented. For instance, on AArch64, Qn registers (128 bits) have
+  // their lower 64 bits accessible through Dn. Calling conventions
+  // preserve Dn but not the upper bits of Qn.
+  // Without this, Qn would only have Dn as its RegUnit and we wouldn't
+  // be able to model the potential clobbering of the upper 64 bits.
+  bit NeedsSelfRegUnit = false;
+
   // HWEncoding - The target specific hardware encoding for this register.
   bits<16> HWEncoding = 0;
 
@@ -1595,15 +1606,15 @@ class AsmParser {
 
   // PreferSmallerInstructions - Should the assembly matcher prefer the smaller
   // instructions.
-  // 
+  //
   // This is useful for the ARM instructions set where smaller encodings must
   // be preferentially selected.
   //
-  // The preference order is: 
+  // The preference order is:
   //    Instrution size (if this option is enabled, smallest first)
-  //    Number of Operands (least first), 
-  //    Operand Classes (lexicographically by operand), 
-  //    (Optional) Instruction id (see AsmMatcherEmitter.cpp for details), 
+  //    Number of Operands (least first),
+  //    Operand Classes (lexicographically by operand),
+  //    (Optional) Instruction id (see AsmMatcherEmitter.cpp for details),
   //    Number of required features (least first)
   bit PreferSmallerInstructions = false;
 }

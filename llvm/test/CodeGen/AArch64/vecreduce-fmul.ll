@@ -415,16 +415,16 @@ define half @fmul_reduct_reassoc_v8f16(<8 x half> %a, <8 x half> %b) {
 ; CHECK-GI-FP16-NEXT:    mov d3, v1.d[1]
 ; CHECK-GI-FP16-NEXT:    fmul v0.4h, v0.4h, v2.4h
 ; CHECK-GI-FP16-NEXT:    fmul v1.4h, v1.4h, v3.4h
-; CHECK-GI-FP16-NEXT:    mov h2, v0.h[1]
-; CHECK-GI-FP16-NEXT:    mov h3, v0.h[2]
-; CHECK-GI-FP16-NEXT:    mov h4, v0.h[3]
-; CHECK-GI-FP16-NEXT:    mov h5, v1.h[1]
-; CHECK-GI-FP16-NEXT:    mov h6, v1.h[2]
-; CHECK-GI-FP16-NEXT:    mov h7, v1.h[3]
-; CHECK-GI-FP16-NEXT:    fmul h0, h0, h2
-; CHECK-GI-FP16-NEXT:    fmul h2, h3, h4
-; CHECK-GI-FP16-NEXT:    fmul h1, h1, h5
-; CHECK-GI-FP16-NEXT:    fmul h3, h6, h7
+; CHECK-GI-FP16-NEXT:    mov h2, v0.h[2]
+; CHECK-GI-FP16-NEXT:    mov h3, v0.h[3]
+; CHECK-GI-FP16-NEXT:    mov h4, v1.h[2]
+; CHECK-GI-FP16-NEXT:    mov h5, v1.h[3]
+; CHECK-GI-FP16-NEXT:    mov h6, v0.h[1]
+; CHECK-GI-FP16-NEXT:    mov h7, v1.h[1]
+; CHECK-GI-FP16-NEXT:    fmul h2, h2, h3
+; CHECK-GI-FP16-NEXT:    fmul h3, h4, h5
+; CHECK-GI-FP16-NEXT:    fmul h0, h0, h6
+; CHECK-GI-FP16-NEXT:    fmul h1, h1, h7
 ; CHECK-GI-FP16-NEXT:    fmul h0, h0, h2
 ; CHECK-GI-FP16-NEXT:    fmul h1, h1, h3
 ; CHECK-GI-FP16-NEXT:    fmul h0, h0, h1

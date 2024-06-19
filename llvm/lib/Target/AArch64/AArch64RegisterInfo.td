@@ -409,7 +409,7 @@ def D30   : AArch64Reg<30, "d30", [S30], ["v30", ""]>, DwarfRegAlias<B30>;
 def D31   : AArch64Reg<31, "d31", [S31], ["v31", ""]>, DwarfRegAlias<B31>;
 }
 
-let SubRegIndices = [dsub], RegAltNameIndices = [vreg, vlist1] in {
+let SubRegIndices = [dsub], RegAltNameIndices = [vreg, vlist1], NeedsSelfRegUnit = true in {
 def Q0    : AArch64Reg<0,   "q0", [D0], ["v0", ""]>, DwarfRegAlias<B0>;
 def Q1    : AArch64Reg<1,   "q1", [D1], ["v1", ""]>, DwarfRegAlias<B1>;
 def Q2    : AArch64Reg<2,   "q2", [D2], ["v2", ""]>, DwarfRegAlias<B2>;

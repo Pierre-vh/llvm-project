@@ -161,6 +161,7 @@ CodeGenRegister::CodeGenRegister(Record *R, unsigned Enum)
     : TheDef(R), EnumValue(Enum),
       CostPerUse(R->getValueAsListOfInts("CostPerUse")),
       CoveredBySubRegs(R->getValueAsBit("CoveredBySubRegs")),
+      NeedsSelfRegUnit(R->getValueAsBit("NeedsSelfRegUnit")),
       HasDisjunctSubRegs(false), Constant(R->getValueAsBit("isConstant")),
       SubRegsComplete(false), SuperRegsComplete(false), TopoSig(~0u) {
   Artificial = R->getValueAsBit("isArtificial");
@@ -449,7 +450,17 @@ CodeGenRegister::computeSubRegs(CodeGenRegBank &RegBank) {
   // Finally, create units for leaf registers without ad hoc aliases. Note that
   // a leaf register with ad hoc aliases doesn't get its own unit - it isn't
   // necessary. This means the aliasing leaf registers can share a single unit.
+  //
+  // Also create an additional RegUnit for registers not fully covered by their subregisters if requested explicitly.
+  //
+  // For example, on AArch64, Qn registers are 128 bits, and the lower 64 bits
+  // can be addressed using Dn. The upper 64 bits cannot be addressed, but we
+  // still need a register to represent them. Those registers set this flag
+  // to create a new RegUnit just for them so the liveness of the upper
+  // 64 bits can be accurately modeled.
   if (RegUnits.empty())
+    RegUnits.set(RegBank.newRegUnit(this));
+  else if(NeedsSelfRegUnit && !CoveredBySubRegs)
     RegUnits.set(RegBank.newRegUnit(this));
 
   // We have now computed the native register units. More may be adopted later

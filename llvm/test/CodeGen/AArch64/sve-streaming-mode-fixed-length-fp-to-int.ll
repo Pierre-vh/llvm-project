@@ -1224,13 +1224,13 @@ define <4 x i16> @fcvtzu_v4f64_v4i16(ptr %a) {
 ; CHECK-NEXT:    fcvtzs z1.d, p0/m, z1.d
 ; CHECK-NEXT:    uzp1 z0.s, z0.s, z0.s
 ; CHECK-NEXT:    uzp1 z1.s, z1.s, z1.s
-; CHECK-NEXT:    mov z2.s, z0.s[1]
 ; CHECK-NEXT:    fmov w8, s0
+; CHECK-NEXT:    mov z2.s, z0.s[1]
 ; CHECK-NEXT:    mov z0.s, z1.s[1]
-; CHECK-NEXT:    fmov w9, s1
 ; CHECK-NEXT:    strh w8, [sp, #12]
+; CHECK-NEXT:    fmov w8, s1
+; CHECK-NEXT:    strh w8, [sp, #8]
 ; CHECK-NEXT:    fmov w8, s2
-; CHECK-NEXT:    strh w9, [sp, #8]
 ; CHECK-NEXT:    strh w8, [sp, #14]
 ; CHECK-NEXT:    fmov w8, s0
 ; CHECK-NEXT:    strh w8, [sp, #10]
@@ -1369,31 +1369,31 @@ define void @fcvtzu_v16f64_v16i16(ptr %a, ptr %b) {
 ; CHECK-NEXT:    fcvtzs z1.d, p0/m, z1.d
 ; CHECK-NEXT:    fcvtzs z0.d, p0/m, z0.d
 ; CHECK-NEXT:    fcvtzs z2.d, p0/m, z2.d
-; CHECK-NEXT:    ldp q6, q7, [x0, #64]
 ; CHECK-NEXT:    fcvtzs z3.d, p0/m, z3.d
+; CHECK-NEXT:    ldp q6, q7, [x0, #64]
 ; CHECK-NEXT:    fcvtzs z5.d, p0/m, z5.d
 ; CHECK-NEXT:    fcvtzs z4.d, p0/m, z4.d
 ; CHECK-NEXT:    uzp1 z1.s, z1.s, z1.s
 ; CHECK-NEXT:    uzp1 z0.s, z0.s, z0.s
-; CHECK-NEXT:    fcvtzs z6.d, p0/m, z6.d
 ; CHECK-NEXT:    uzp1 z2.s, z2.s, z2.s
 ; CHECK-NEXT:    uzp1 z3.s, z3.s, z3.s
+; CHECK-NEXT:    fcvtzs z6.d, p0/m, z6.d
 ; CHECK-NEXT:    uzp1 z5.s, z5.s, z5.s
 ; CHECK-NEXT:    fmov w8, s1
 ; CHECK-NEXT:    mov z16.s, z1.s[1]
 ; CHECK-NEXT:    mov z1.s, z0.s[1]
-; CHECK-NEXT:    fmov w9, s0
-; CHECK-NEXT:    mov z0.s, z2.s[1]
 ; CHECK-NEXT:    strh w8, [sp, #12]
+; CHECK-NEXT:    fmov w8, s0
+; CHECK-NEXT:    mov z0.s, z2.s[1]
+; CHECK-NEXT:    strh w8, [sp, #8]
 ; CHECK-NEXT:    fmov w8, s2
 ; CHECK-NEXT:    mov z2.s, z3.s[1]
-; CHECK-NEXT:    strh w9, [sp, #8]
-; CHECK-NEXT:    fmov w9, s3
+; CHECK-NEXT:    strh w8, [sp, #4]
+; CHECK-NEXT:    fmov w8, s3
 ; CHECK-NEXT:    movprfx z3, z7
 ; CHECK-NEXT:    fcvtzs z3.d, p0/m, z7.d
-; CHECK-NEXT:    strh w8, [sp, #4]
+; CHECK-NEXT:    strh w8, [sp]
 ; CHECK-NEXT:    fmov w8, s16
-; CHECK-NEXT:    strh w9, [sp]
 ; CHECK-NEXT:    strh w8, [sp, #14]
 ; CHECK-NEXT:    fmov w8, s1
 ; CHECK-NEXT:    uzp1 z1.s, z4.s, z4.s
@@ -2970,13 +2970,13 @@ define <4 x i16> @fcvtzs_v4f64_v4i16(ptr %a) {
 ; CHECK-NEXT:    fcvtzs z1.d, p0/m, z1.d
 ; CHECK-NEXT:    uzp1 z0.s, z0.s, z0.s
 ; CHECK-NEXT:    uzp1 z1.s, z1.s, z1.s
-; CHECK-NEXT:    mov z2.s, z0.s[1]
 ; CHECK-NEXT:    fmov w8, s0
+; CHECK-NEXT:    mov z2.s, z0.s[1]
 ; CHECK-NEXT:    mov z0.s, z1.s[1]
-; CHECK-NEXT:    fmov w9, s1
 ; CHECK-NEXT:    strh w8, [sp, #12]
+; CHECK-NEXT:    fmov w8, s1
+; CHECK-NEXT:    strh w8, [sp, #8]
 ; CHECK-NEXT:    fmov w8, s2
-; CHECK-NEXT:    strh w9, [sp, #8]
 ; CHECK-NEXT:    strh w8, [sp, #14]
 ; CHECK-NEXT:    fmov w8, s0
 ; CHECK-NEXT:    strh w8, [sp, #10]
@@ -3115,31 +3115,31 @@ define void @fcvtzs_v16f64_v16i16(ptr %a, ptr %b) {
 ; CHECK-NEXT:    fcvtzs z1.d, p0/m, z1.d
 ; CHECK-NEXT:    fcvtzs z0.d, p0/m, z0.d
 ; CHECK-NEXT:    fcvtzs z2.d, p0/m, z2.d
-; CHECK-NEXT:    ldp q6, q7, [x0, #64]
 ; CHECK-NEXT:    fcvtzs z3.d, p0/m, z3.d
+; CHECK-NEXT:    ldp q6, q7, [x0, #64]
 ; CHECK-NEXT:    fcvtzs z5.d, p0/m, z5.d
 ; CHECK-NEXT:    fcvtzs z4.d, p0/m, z4.d
 ; CHECK-NEXT:    uzp1 z1.s, z1.s, z1.s
 ; CHECK-NEXT:    uzp1 z0.s, z0.s, z0.s
-; CHECK-NEXT:    fcvtzs z6.d, p0/m, z6.d
 ; CHECK-NEXT:    uzp1 z2.s, z2.s, z2.s
 ; CHECK-NEXT:    uzp1 z3.s, z3.s, z3.s
+; CHECK-NEXT:    fcvtzs z6.d, p0/m, z6.d
 ; CHECK-NEXT:    uzp1 z5.s, z5.s, z5.s
 ; CHECK-NEXT:    fmov w8, s1
 ; CHECK-NEXT:    mov z16.s, z1.s[1]
 ; CHECK-NEXT:    mov z1.s, z0.s[1]
-; CHECK-NEXT:    fmov w9, s0
-; CHECK-NEXT:    mov z0.s, z2.s[1]
 ; CHECK-NEXT:    strh w8, [sp, #12]
+; CHECK-NEXT:    fmov w8, s0
+; CHECK-NEXT:    mov z0.s, z2.s[1]
+; CHECK-NEXT:    strh w8, [sp, #8]
 ; CHECK-NEXT:    fmov w8, s2
 ; CHECK-NEXT:    mov z2.s, z3.s[1]
-; CHECK-NEXT:    strh w9, [sp, #8]
-; CHECK-NEXT:    fmov w9, s3
+; CHECK-NEXT:    strh w8, [sp, #4]
+; CHECK-NEXT:    fmov w8, s3
 ; CHECK-NEXT:    movprfx z3, z7
 ; CHECK-NEXT:    fcvtzs z3.d, p0/m, z7.d
-; CHECK-NEXT:    strh w8, [sp, #4]
+; CHECK-NEXT:    strh w8, [sp]
 ; CHECK-NEXT:    fmov w8, s16
-; CHECK-NEXT:    strh w9, [sp]
 ; CHECK-NEXT:    strh w8, [sp, #14]
 ; CHECK-NEXT:    fmov w8, s1
 ; CHECK-NEXT:    uzp1 z1.s, z4.s, z4.s
