@@ -112,6 +112,10 @@ class raw_ostream;
       InstrDist = 4 * Slot_Count
     };
 
+    void * asOpaqueValue() const {
+      return lie.getOpaqueValue();
+    }
+
     /// Construct an invalid index.
     SlotIndex() = default;
 

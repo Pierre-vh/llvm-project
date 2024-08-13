@@ -140,6 +140,8 @@ void LiveIntervalCalc::extendToUses(LiveRange &LR, Register Reg,
   if (LI != nullptr)
     LI->computeSubRangeUndefs(Undefs, Mask, *MRI, *Indexes);
 
+  SmallDenseSet<void*> IndexesHandled;
+
   // Visit all operands that read Reg. This may include partial defs.
   bool IsSubRange = !Mask.all();
   const TargetRegisterInfo &TRI = *MRI->getTargetRegisterInfo();
@@ -190,6 +192,7 @@ void LiveIntervalCalc::extendToUses(LiveRange &LR, Register Reg,
 
     // MI is reading Reg. We may have visited MI before if it happens to be
     // reading Reg multiple times. That is OK, extend() is idempotent.
-    extend(LR, UseIdx, Reg, Undefs);
+    if (IndexesHandled.insert(UseIdx.asOpaqueValue()).second)
+      extend(LR, UseIdx, Reg, Undefs);
   }
 }
