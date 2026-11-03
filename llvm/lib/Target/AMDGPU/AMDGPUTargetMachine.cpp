@@ -28,6 +28,7 @@
 #include "AMDGPUISelDAGToDAG.h"
 #include "AMDGPULowerVGPREncoding.h"
 #include "AMDGPUMacroFusion.h"
+#include "AMDGPUNewInsertWaitcnts.h"
 #include "AMDGPUNextUseAnalysis.h"
 #include "AMDGPUPerfHintAnalysis.h"
 #include "AMDGPUPreloadKernArgProlog.h"
@@ -424,6 +425,11 @@ static bool isLTOPreLink(ThinOrFullLTOPhase Phase) {
 }
 } // anonymous namespace
 
+static cl::opt<bool> EnableNewInsertWaitcnts(
+    "enable-new-insertwaitcnts", cl::Hidden,
+    cl::desc("Run AMDGPUNewInsertWaitcnts instead of SIInsertWaitcnts"),
+    cl::init(false));
+
 static cl::opt<bool>
 EnableEarlyIfConversion("amdgpu-early-ifcvt", cl::Hidden,
                         cl::desc("Run early if-conversion"),
@@ -736,6 +742,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPULowerVGPREncodingLegacyPass(*PR);
   initializeSIInsertHardClausesLegacyPass(*PR);
   initializeSIInsertWaitcntsLegacyPass(*PR);
+  initializeAMDGPUNewInsertWaitcntsLegacyPass(*PR);
   initializeSIModeRegisterLegacyPass(*PR);
   initializeSIWholeQuadModeLegacyPass(*PR);
   initializeSILowerControlFlowLegacyPass(*PR);
@@ -2033,7 +2040,10 @@ void GCNPassConfig::addPreEmitPass() {
   addPass(createSIMemoryLegalizerPass());
   if (getOptLevel() > CodeGenOptLevel::None)
     addPass(&SIPostRA16BitMovFoldingLegacyID);
-  addPass(createSIInsertWaitcntsPass());
+  if (EnableNewInsertWaitcnts)
+    addPass(&AMDGPUNewInsertWaitcntsLegacyID);
+  else
+    addPass(createSIInsertWaitcntsPass());
 
   addPass(createSIModeRegisterPass());
 
@@ -2789,7 +2799,10 @@ void AMDGPUCodeGenPassBuilder::addPreEmitPass(PassManagerWrapper &PMW) {
   addMachineFunctionPass(SIMemoryLegalizerPass(), PMW);
   if (TM.getOptLevel() > CodeGenOptLevel::None)
     addMachineFunctionPass(SIPostRA16BitMovFoldingPass(), PMW);
-  addMachineFunctionPass(SIInsertWaitcntsPass(), PMW);
+  if (EnableNewInsertWaitcnts)
+    addMachineFunctionPass(AMDGPUNewInsertWaitcntsPass(), PMW);
+  else
+    addMachineFunctionPass(SIInsertWaitcntsPass(), PMW);
 
   addMachineFunctionPass(SIModeRegisterPass(), PMW);
 

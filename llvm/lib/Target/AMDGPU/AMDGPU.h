@@ -602,6 +602,9 @@ extern char &SIInsertHardClausesID;
 void initializeSIInsertWaitcntsLegacyPass(PassRegistry &);
 extern char &SIInsertWaitcntsID;
 
+void initializeAMDGPUNewInsertWaitcntsLegacyPass(PassRegistry &);
+extern char &AMDGPUNewInsertWaitcntsLegacyID;
+
 void initializeSIFormMemoryClausesLegacyPass(PassRegistry &);
 extern char &SIFormMemoryClausesID;
 
