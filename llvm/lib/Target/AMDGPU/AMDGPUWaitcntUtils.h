@@ -9,8 +9,11 @@
 #ifndef LLVM_LIB_TARGET_AMDGPU_AMDGPUWAITCNTUTILS_H
 #define LLVM_LIB_TARGET_AMDGPU_AMDGPUWAITCNTUTILS_H
 
+#include "AMDGPUHWEvents.h"
 #include "llvm/ADT/Sequence.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/AMDGPUTargetParser.h"
@@ -19,6 +22,7 @@ namespace llvm {
 
 class Function;
 class GCNSubtarget;
+class MachineFunction;
 
 namespace AMDGPU {
 
@@ -208,6 +212,70 @@ unsigned encodeStorecntDscnt(const IsaVersion &Version, const Waitcnt &Decoded);
 /// Determine if \p MI is a gfx12+ single-counter S_WAIT_*CNT instruction,
 /// and if so, which counter it is waiting on.
 std::optional<AMDGPU::InstCounterType> counterTypeForInstr(unsigned Opcode);
+
+/// TODO: Integrate this further into the compiler to eliminate redundancy.
+class AMDGPUInstCounter {
+public:
+  /// Value returned by getLimit() when the counter has no known limit.
+  static constexpr unsigned NoLimit = ~0u;
+
+  AMDGPUInstCounter(unsigned Index, InstCounterType Type, unsigned Limit,
+                    StringRef Name, HWEvents Events)
+      : Index(Index), Type(Type), Limit(Limit), Name(Name), Events(Events) {}
+
+  /// \return the zero-based position of this counter in the result of
+  /// getCounters(). This is not the same as getType().
+  unsigned getIndex() const { return Index; }
+
+  /// \return the InstCounterType this counter corresponds to.
+  /// TODO: InstCounterType should be removed entirely.
+  InstCounterType getType() const { return Type; }
+
+  /// \return true if this counter has a known hardware limit.
+  bool hasLimit() const { return Limit != NoLimit; }
+
+  /// \return the hardware limit for this counter, or \c NoLimit if there is
+  /// none. Hardware will stall new instruction issues for this counter when the
+  /// limit is reached to prevent overflow.
+  unsigned getLimit() const { return Limit; }
+
+  /// \return the canonical name for this counter on the target.
+  StringRef getName() const { return Name; }
+
+  /// \return the set of hardware events tracked by this counter.
+  HWEvents getEvents() const { return Events; }
+
+  friend bool operator==(const AMDGPUInstCounter &LHS,
+                         const AMDGPUInstCounter &RHS) {
+    return LHS.Index == RHS.Index && LHS.Type == RHS.Type &&
+           LHS.Limit == RHS.Limit && LHS.Name == RHS.Name &&
+           LHS.Events == RHS.Events;
+  }
+
+  friend bool operator!=(const AMDGPUInstCounter &LHS,
+                         const AMDGPUInstCounter &RHS) {
+    return !(LHS == RHS);
+  }
+
+private:
+  unsigned Index;
+  InstCounterType Type;
+  unsigned Limit;
+  StringRef Name;
+  HWEvents Events;
+};
+
+/// \return the counters available on \p ST, ordered by index. Counters that
+/// do not exist on \p ST are omitted. Expert scheduling mode counters are
+/// only included if \p IsExpertMode is set (this is ignored on subtargets
+/// without extended wait counts).
+SmallVector<AMDGPUInstCounter, NUM_INST_CNTS>
+getCounters(const GCNSubtarget &ST, bool IsExpertMode);
+
+/// Same as above, but derives the subtarget and expert scheduling mode from
+/// \p MF.
+SmallVector<AMDGPUInstCounter, NUM_INST_CNTS>
+getCounters(const MachineFunction &MF);
 
 } // namespace AMDGPU
 

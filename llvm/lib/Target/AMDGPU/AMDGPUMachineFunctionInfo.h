@@ -9,8 +9,11 @@
 #ifndef LLVM_LIB_TARGET_AMDGPU_AMDGPUMACHINEFUNCTION_H
 #define LLVM_LIB_TARGET_AMDGPU_AMDGPUMACHINEFUNCTION_H
 
+#include "AMDGPUWaitcntUtils.h"
 #include "Utils/AMDGPUBaseInfo.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
@@ -69,6 +72,10 @@ protected:
 
   bool HasInitWholeWave = false;
 
+  /// Instruction counters available on the subtarget. Only populated for
+  /// subtargets that have them (GCN).
+  SmallVector<AMDGPU::AMDGPUInstCounter, AMDGPU::NUM_INST_CNTS> InstCounters;
+
 public:
   AMDGPUMachineFunctionInfo(const Function &F, const AMDGPUSubtarget &ST);
 
@@ -101,6 +108,11 @@ public:
 
   bool hasInitWholeWave() const { return HasInitWholeWave; }
   void setInitWholeWave() { HasInitWholeWave = true; }
+
+  /// \return the instruction counters of this function, ordered by index.
+  ArrayRef<AMDGPU::AMDGPUInstCounter> getInstCounters() const {
+    return InstCounters;
+  }
 
   unsigned allocateLDSGlobal(const DataLayout &DL, const GlobalVariable &GV) {
     return allocateLDSGlobal(DL, GV, DynLDSAlign);

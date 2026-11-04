@@ -56,6 +56,7 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const Function &F,
       IsWholeWaveFunction(F.getCallingConv() ==
                           CallingConv::AMDGPU_Gfx_WholeWave) {
   const GCNSubtarget &ST = *STI;
+  InstCounters = AMDGPU::getCounters(ST, AMDGPU::isExpertSchedulingMode(ST, F));
   FlatWorkGroupSizes = ST.getFlatWorkGroupSizes(F);
   WavesPerEU = ST.getWavesPerEU(F);
   MaxNumWorkGroups = AMDGPU::getMaxNumWorkGroups(F);
