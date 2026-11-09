@@ -22,6 +22,7 @@
 #include "AMDGPUHWEvents.h"
 #include "AMDGPUMachineFunctionInfo.h"
 #include "AMDGPUNewInsertWaitcntsUtils.h"
+#include "AMDGPUWaitcntRewriter.h"
 #include "GCNSubtarget.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -102,8 +103,9 @@ public:
 
   /// Computes the waits of every block into \p Sol without modifying the MIR.
   void solve(Solution &Sol);
-  /// Emits the waits in \p Sol into the MIR, replacing existing wait runs.
-  void apply(const Solution &Sol);
+  /// Emits the waits in \p Sol into the MIR, rewriting the preceding waits of each decision point.
+  /// \returns true if the MIR changed.
+  bool apply(const Solution &Sol);
 
   /// Checks that the emitted MIR satisfies every dependency (debug aid).
   void verify();
@@ -130,10 +132,10 @@ private:
                         const DenseSet<const MachineBasicBlock *> &ForceDrain);
 
   /// \returns everything to wait for before \p MI (at the end of the block if
-  /// \p MI is null): the existing waits in \p WaitsSeen (soft ones simplified),
+  /// \p MI is null): the preceding waits \p Preceding (soft ones simplified),
   /// \p ExtraWait, and the waits \p MI requires.
   Waitcnt getWaitsBefore(const State &S, const MachineInstr *MI,
-                         const AggregatedWaitcnts &WaitsSeen,
+                         const PrecedingWaits &Preceding,
                          Waitcnt ExtraWait);
   /// \returns the waits \p MI requires in state \p S: its dependencies on
   /// pending records, and the counters that must be empty before it.
@@ -209,6 +211,13 @@ private:
   /// \p IncludeStores.
   Waitcnt getAllZeroWaitcnt(bool IncludeStores) const;
 
+#ifndef NDEBUG
+  /// Asserts that the rewritten preceding waits of \p It wait for exactly \p W.
+  void checkRewrite(const WaitcntRewriter &Rewriter, MachineBasicBlock &MBB,
+                    MachineBasicBlock::instr_iterator It,
+                    const Waitcnt &W) const;
+#endif
+
   /// \returns the wait at the start of a non-entry function, for the
   /// operations its caller left in flight (stores excluded).
   Waitcnt getEntryWait() const;
@@ -232,7 +241,7 @@ private:
   /// does not decrement both counters in order.
   bool flatForcesZero(const State &S, InstCounterType T) const;
 
-  const MachineFunction &MF;
+  MachineFunction &MF;
   MachineLoopInfo &MLI;
   MachinePostDominatorTree &PDT;
   AAResults *AA = nullptr;
@@ -414,21 +423,21 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsAtEnd(
 
 Waitcnt
 AMDGPUNewInsertWaitcnts::getWaitsBefore(const State &S, const MachineInstr *MI,
-                                        const AggregatedWaitcnts &WaitsSeen,
+                                        const PrecedingWaits &Preceding,
                                         Waitcnt ExtraWait) {
-  Waitcnt W = WaitsSeen.CombinedWaits;
+  Waitcnt W = Preceding.CombinedWaits;
 
-  for (const Waitcnt &Soft : WaitsSeen.SoftWaits) {
+  for (const Waitcnt &Soft : Preceding.SoftWaits) {
     W = W.combined(simplify(S, Soft));
   }
 
-  if (WaitsSeen.SeenLDSDirectWait) {
+  if (Preceding.SeenLDSDirectWait) {
     waitForMatchingRecords(
         W, S, LOAD_CNT, /*DrainAll=*/false,
         [&](const auto &R) { return TII.isNonAsyncLdsDmaWrite(*R.getMI()); });
   }
 
-  // TODO: WAIT_ASYNCMARK in Run (App. B).
+  // TODO: WAIT_ASYNCMARK in the preceding waits (App. B).
 
   W = W.combined(ExtraWait);
   if (MI)
@@ -871,9 +880,15 @@ void AMDGPUNewInsertWaitcnts::recordEvents(State &S, MachineInstr &MI) {
   //   applyWait(S, waitOn(EXP_CNT, Limit(EXP_CNT)));
   // }
 
-  // if (TII.isVINTERP(MI)) { // waitexp = implicit EXP_CNT wait (SIW:2763-2764)
-  //   applyWait(S, waitOn(EXP_CNT, waitexpOf(MI)));
-  // }
+  // The waitexp operand of VINTERP is an implicit EXP_CNT wait (SIW:2744-2746).
+  // WaitcntRewriter may lower it to fold the wait decided before MI, which
+  // applyWait has already modelled.
+  if (TII.isVINTERP(MI)) {
+    Waitcnt WaitExp;
+    WaitExp.set(EXP_CNT,
+                TII.getNamedOperand(MI, AMDGPU::OpName::waitexp)->getImm());
+    applyWait(S, WaitExp);
+  }
 
   // TODO: ASYNCMARK push (App. B).
 }
@@ -882,9 +897,13 @@ void AMDGPUNewInsertWaitcnts::setStateOnFunctionEntryOrReturn(State &S) {}
 
 Waitcnt
 AMDGPUNewInsertWaitcnts::getWaitsForcedAfter(const MachineInstr &MI) const {
+  // SIW:2692-2700.
+  Waitcnt W;
   if (ST.isPreciseMemoryEnabled() && MI.mayLoadOrStore())
-    return getAllZeroWaitcnt(MI.mayStore() && !SIInstrInfo::isAtomicRet(MI));
-  return Waitcnt();
+    W = getAllZeroWaitcnt(MI.mayStore() && !SIInstrInfo::isAtomicRet(MI));
+  if (TII.isAlwaysGDS(MI.getOpcode()))
+    W.set(DS_CNT, 0);
+  return W;
 }
 
 Waitcnt AMDGPUNewInsertWaitcnts::getEntryWait() const {
@@ -984,20 +1003,20 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
   // TODO: VCCZ schtuff
 
   // TODO: carry stuff
-  AggregatedWaitcnts WaitsSeen;
+  PrecedingWaits Preceding;
   PendingWaitAfter PWA;
 
   // The entry wait is folded into the first decision point: the first
   // instruction that is neither a wait nor a meta instruction, or the end of
   // the block if there is none. This matches the old pass, which inserts
   // S_WAITCNT 0 before the first non-meta instruction (SIW:3492-3494): any wait
-  // already there joins the same run. It is not simplified: it waits for the
+  // already there joins the same preceding waits. It is not simplified: it waits for the
   // caller's unknown operations.
   bool NeedsEntryWait = IsEntryWithWaits;
 
   for (MachineInstr &MI : MBB.instrs()) {
     if (isWaitInstr(MI)) {
-      WaitsSeen.add(MI, IV);
+      Preceding.add(MI, IV);
       continue;
     }
 
@@ -1015,17 +1034,19 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
       Extra = Extra.combined(getWaitsAtEnd(S, MBB, ForceDrain));
     }
 
-    Waitcnt W = getWaitsBefore(S, &MI, WaitsSeen, Extra);
+    Waitcnt W = getWaitsBefore(S, &MI, Preceding, Extra);
     applyWait(S, W);
     if (Sol) {
       (*Sol)[MBB].Before[&MI] = W;
-      // if (C.AlwaysGDS && W.hasWait() && MI.getOpcode() == AMDGPU::S_ENDPGM) {
-      //   (*Sol)[MBB].NopAfterWait.insert(&MI);
-      // }
+      // SIW:2702-2710: S_NOP between the forced wait after an always-GDS
+      // instruction and S_ENDPGM.
+      if (PWA.AlwaysGDS && PWA.W.hasWait() &&
+          isNextNonMetaEndpgm(MBB, MI.getIterator()))
+        (*Sol)[MBB].NopAfterWait.insert(&MI);
     }
 
     recordEvents(S, MI);
-    WaitsSeen = {};
+    Preceding = {};
     PWA = {removeNoOpWaits(S, getWaitsForcedAfter(MI)),
            TII.isAlwaysGDS(MI.getOpcode())};
   }
@@ -1034,28 +1055,78 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
     Waitcnt Extra = PWA.W.combined(getWaitsAtEnd(S, MBB, ForceDrain));
     if (NeedsEntryWait) // entry block with only waits and meta instructions
       Extra = Extra.combined(getEntryWait());
-    Waitcnt W = getWaitsBefore(S, /*MI=*/nullptr, WaitsSeen, Extra);
+    Waitcnt W = getWaitsBefore(S, /*MI=*/nullptr, Preceding, Extra);
     applyWait(S, W);
     if (Sol) {
       (*Sol)[MBB].AtEnd = W;
-      //(*Sol)[&MBB].NopAfterAtEnd =
-      //    C.AlwaysGDS && W.hasWait() && nextIsEndpgm(MBB);
+      (*Sol)[MBB].NopAfterAtEnd = PWA.AlwaysGDS && PWA.W.hasWait() &&
+                                  isNextNonMetaEndpgm(MBB, MBB.instr_end());
     }
   }
 
   // assert(C.W == Waitcnt() && "forced-after wait on a terminator");
 }
 
-void AMDGPUNewInsertWaitcnts::apply(const Solution &Sol) {
-  for (auto &[MBB, BS] : Sol) {
-    for (auto &[MI, W] : BS.Before) {
-      // TODO: Apply wait
+bool AMDGPUNewInsertWaitcnts::apply(const Solution &Sol) {
+  WaitcntRewriter Rewriter(ST, InstCounters);
+  bool Modified = false;
+
+  const auto Rewrite = [&](MachineBasicBlock &MBB,
+                           MachineBasicBlock::instr_iterator It, Waitcnt W,
+                           bool NopAfter) {
+    Modified |= Rewriter.rewrite(MBB, It, W, NopAfter);
+#ifndef NDEBUG
+    checkRewrite(Rewriter, MBB, It, W);
+#endif
+  };
+
+  // Program order, for deterministic MIR mutation and debug output. Blocks
+  // without a solution are unreachable and left alone, like the old pass.
+  for (MachineBasicBlock &MBB : MF) {
+    const Solution::BasicBlockSolution *BS = Sol.lookup(MBB);
+    if (!BS)
+      continue;
+
+    // Rewriting only touches the preceding waits of MI and inserts before MI, so the
+    // iteration is not invalidated.
+    for (MachineInstr &MI : make_early_inc_range(MBB.instrs())) {
+      auto It = BS->Before.find(&MI);
+      if (It != BS->Before.end())
+        Rewrite(MBB, MI.getIterator(), It->second,
+                BS->NopAfterWait.contains(&MI));
     }
-    if (BS.AtEnd) {
-      // TODO: Apply wait
+    if (BS->AtEnd)
+      Rewrite(MBB, MBB.instr_end(), *BS->AtEnd, BS->NopAfterAtEnd);
+  }
+  return Modified;
+}
+
+#ifndef NDEBUG
+void AMDGPUNewInsertWaitcnts::checkRewrite(
+    const WaitcntRewriter &Rewriter, MachineBasicBlock &MBB,
+    MachineBasicBlock::instr_iterator It, const Waitcnt &W) const {
+  // The rewritten preceding waits must wait for exactly W. A VINTERP's original waitexp may
+  // be stronger than W on EXP_CNT. Encodings have no "no wait" value: a field
+  // left alone decodes to the counter limit, which never blocks, so values at
+  // or above the limit compare equal to ~0u.
+  Waitcnt Got = Rewriter.decodePrecedingWaits(MBB, It);
+  bool IsVINTERP = It != MBB.instr_end() && SIInstrInfo::isVINTERP(*It);
+  for (const AMDGPUInstCounter &IC : InstCounters) {
+    InstCounterType T = IC.getType();
+    const auto Normalize = [&](unsigned V) {
+      return IC.hasLimit() && V >= IC.getLimit() ? ~0u : V;
+    };
+    unsigned GotV = Normalize(Got.get(T));
+    unsigned WantV = Normalize(W.get(T));
+    bool OK = (IsVINTERP && T == EXP_CNT) ? GotV <= WantV : GotV == WantV;
+    if (!OK) {
+      dbgs() << "Expected " << W << "Got " << Got << "in " << MBB.getName()
+             << '\n';
+      llvm_unreachable("emitted waits differ from the solution");
     }
   }
 }
+#endif
 
 void AMDGPUNewInsertWaitcnts::verify() {
   // TODO in a future batch of work; not critical for now.
@@ -1065,13 +1136,12 @@ bool AMDGPUNewInsertWaitcnts::run() {
   Solution Sol;
 
   solve(Sol);
-  apply(Sol);
+  bool Modified = apply(Sol);
 
   if (Opts.Verify)
     verify();
 
-  // FIXME: Return something meaningful here.
-  return true;
+  return Modified;
 }
 
 class AMDGPUNewInsertWaitcntsLegacy : public MachineFunctionPass {

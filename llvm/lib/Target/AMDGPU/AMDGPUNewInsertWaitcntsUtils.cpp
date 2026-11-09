@@ -55,8 +55,10 @@ Waitcnt decode(const MachineInstr &MI, const IsaVersion &IV) {
   Waitcnt W;
   switch (Opcode) {
   case AMDGPU::S_WAITCNT:
-    // TODO(gfx12+): the old pass leaves legacy S_WAITCNT alone on targets
-    // with extended wait counts (SIW:1922) and doesn't model it.
+    // Like the old pass, legacy S_WAITCNT is not modelled on targets with
+    // extended wait counts (SIW:1922); WaitcntRewriter leaves it alone.
+    if (IV.Major >= 12)
+      return W;
     return decodeWaitcnt(IV, GetImm());
   case AMDGPU::S_WAITCNT_VSCNT:
     assert(MI.getOperand(0).getReg() == AMDGPU::SGPR_NULL);
@@ -86,6 +88,37 @@ Waitcnt decode(const MachineInstr &MI, const IsaVersion &IV) {
   assert(T && "not a wait instruction");
   W.set(*T, GetImm());
   return W;
+}
+
+MachineBasicBlock::instr_iterator
+getPrecedingWaitsBegin(MachineBasicBlock &MBB,
+                       MachineBasicBlock::instr_iterator It) {
+  MachineBasicBlock::instr_iterator Begin = It;
+  while (Begin != MBB.instr_begin()) {
+    MachineInstr &Prev = *std::prev(Begin);
+    if (!isWaitInstr(Prev) && !isNonWaitcntMetaInst(Prev))
+      break;
+    --Begin;
+  }
+  return Begin;
+}
+
+bool isNextNonMetaEndpgm(MachineBasicBlock &MBB,
+                         MachineBasicBlock::instr_iterator It) {
+  // Port of SIInsertWaitcnts::isNextENDPGM (SIW:2660-2684).
+  MachineFunction::iterator BlockIt = MBB.getIterator();
+  MachineFunction::iterator BlockEnd = MBB.getParent()->end();
+  while (true) {
+    if (It == BlockIt->instr_end()) {
+      if (++BlockIt == BlockEnd)
+        return false;
+      It = BlockIt->instr_begin();
+      continue;
+    }
+    if (!It->isMetaInstruction())
+      return It->getOpcode() == AMDGPU::S_ENDPGM;
+    ++It;
+  }
 }
 
 bool trackedRegsOverlap(const SIRegisterInfo &TRI, MCRegister A,
@@ -310,7 +343,7 @@ void WaitcntLoopPreheaderInfo::init() {
   // TODO: Spin up new agent with previous context to implement this.
 }
 
-void AggregatedWaitcnts::add(MachineInstr &MI, const IsaVersion &IV) {
+void PrecedingWaits::add(MachineInstr &MI, const IsaVersion &IV) {
   assert(isWaitInstr(MI));
 
   unsigned Opcode = SIInstrInfo::getNonSoftWaitcntOpcode(MI.getOpcode());

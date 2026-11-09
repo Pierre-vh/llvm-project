@@ -16,6 +16,7 @@
 #include "AMDGPUWaitcntUtils.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/MC/MCRegister.h"
 #include <optional>
 
@@ -45,8 +46,23 @@ bool isNonWaitcntMetaInst(const MachineInstr &MI);
 /// \pre isWaitInstr(MI) and \p MI is not S_WAITCNT_lds_direct, whose wait
 /// depends on the pending LDS DMAs.
 /// WAIT_ASYNCMARK is decoded conservatively as a full drain of the counters
-/// that track asynchronous operations.
+/// that track asynchronous operations. Legacy S_WAITCNT on gfx12+ decodes to
+/// no wait.
 Waitcnt decode(const MachineInstr &MI, const IsaVersion &IV);
+
+/// \returns the start of the preceding waits of \p It: the maximal sequence of
+/// wait instructions (isWaitInstr) and non-wait meta instructions
+/// (isNonWaitcntMetaInst) right before \p It, within \p MBB. \returns \p It
+/// if there are none.
+MachineBasicBlock::instr_iterator
+getPrecedingWaitsBegin(MachineBasicBlock &MBB,
+                       MachineBasicBlock::instr_iterator It);
+
+/// \returns true if the first non-meta instruction at or after \p It is
+/// S_ENDPGM, continuing into the next blocks in layout order when the end of
+/// \p MBB is reached.
+bool isNextNonMetaEndpgm(MachineBasicBlock &MBB,
+                         MachineBasicBlock::instr_iterator It);
 
 //===----------------------------------------------------------------------===//
 // Register and memory dependency helpers
@@ -131,10 +147,26 @@ public:
     // waitcnt.
     std::optional<Waitcnt> AtEnd;
 
+    // S_ENDPGM instructions that need an `S_NOP 0` between the wait before
+    // them and themselves (forced wait after an always-GDS instruction).
+    DenseSet<const MachineInstr *> NopAfterWait;
+
+    // Same as NopAfterWait, for AtEnd (S_ENDPGM in a later block).
+    bool NopAfterAtEnd = false;
+
     bool operator==(const BasicBlockSolution &Other) const {
-      return Before == Other.Before && AtEnd == Other.AtEnd;
+      return Before == Other.Before && AtEnd == Other.AtEnd &&
+             NopAfterWait == Other.NopAfterWait &&
+             NopAfterAtEnd == Other.NopAfterAtEnd;
     }
   };
+
+  /// \returns the solution of \p MBB, or nullptr if \p MBB was never
+  /// visited (unreachable).
+  const BasicBlockSolution *lookup(const MachineBasicBlock &MBB) const {
+    auto It = Solutions.find(&MBB);
+    return It == Solutions.end() ? nullptr : &It->second;
+  }
 
   const BasicBlockSolution &operator[](const MachineBasicBlock &MBB) const {
     return Solutions.at(&MBB);
@@ -243,9 +275,9 @@ private:
   DenseMap<const MachineLoop *, Entry> Entries;
 };
 
-/// Information about all waitcnts encountered until a certain point when
-/// iterating a function.
-struct AggregatedWaitcnts {
+/// The decoded preceding waits of an instruction (see getPrecedingWaitsBegin),
+/// accumulated while walking a block.
+struct PrecedingWaits {
   Waitcnt CombinedWaits;
   SmallVector<Waitcnt> SoftWaits;
   bool SeenLDSDirectWait = false;
