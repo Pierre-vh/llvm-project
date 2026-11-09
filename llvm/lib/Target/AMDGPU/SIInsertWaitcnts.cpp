@@ -404,29 +404,11 @@ public:
   bool mayStoreIncrementingDSCNT(const MachineInstr &MI) const;
   bool run();
 
-  bool isAsync(const MachineInstr &MI) const {
-    if (!SIInstrInfo::isLDSDMA(MI))
-      return false;
-    if (SIInstrInfo::usesASYNC_CNT(MI))
-      return true;
-    const MachineOperand *Async =
-        TII.getNamedOperand(MI, AMDGPU::OpName::IsAsync);
-    return Async && (Async->getImm());
-  }
-
-  bool isNonAsyncLdsDmaWrite(const MachineInstr &MI) const {
-    return SIInstrInfo::mayWriteLDSThroughDMA(MI) && !isAsync(MI);
-  }
-
-  bool isAsyncLdsDmaWrite(const MachineInstr &MI) const {
-    return SIInstrInfo::mayWriteLDSThroughDMA(MI) && isAsync(MI);
-  }
-
   bool shouldUpdateAsyncMark(const MachineInstr &MI,
                              AMDGPU::InstCounterType T) const {
     if (SIInstrInfo::usesTENSOR_CNT(MI))
       return T == AMDGPU::TENSOR_CNT;
-    if (!isAsyncLdsDmaWrite(MI))
+    if (!TII.isAsyncLdsDmaWrite(MI))
       return false;
     if (SIInstrInfo::usesASYNC_CNT(MI))
       return T == AMDGPU::ASYNC_CNT;
@@ -1047,7 +1029,7 @@ void WaitcntBrackets::updateByEvent(HWEvents E, MachineInstr &Inst) {
       setScoreByOperand(Op, T, CurrScore);
     }
     if (Inst.mayStore() &&
-        (TII.isDS(Inst) || Context->isNonAsyncLdsDmaWrite(Inst))) {
+        (TII.isDS(Inst) || TII.isNonAsyncLdsDmaWrite(Inst))) {
       // MUBUF and FLAT LDS DMA operations need a wait on vmcnt before LDS
       // written can be accessed. A load from LDS to VMEM does not need a wait.
       //

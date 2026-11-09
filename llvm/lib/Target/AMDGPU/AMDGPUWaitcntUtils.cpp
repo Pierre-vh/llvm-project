@@ -351,4 +351,20 @@ getCounters(const MachineFunction &MF) {
   return getCounters(ST, isExpertSchedulingMode(ST, MF.getFunction()));
 }
 
+const AMDGPUInstCounter &getCounter(InstCounterType T,
+                                    ArrayRef<AMDGPUInstCounter> Counters) {
+  const AMDGPUInstCounter *It = find_if(
+      Counters, [&](const AMDGPUInstCounter &C) { return C.getType() == T; });
+  assert(It != Counters.end() && "counter not available on target");
+  return *It;
+}
+
+const AMDGPUInstCounter*
+getCounterForEvent(HWEvents Event, ArrayRef<AMDGPUInstCounter> Counters) {
+  for (const AMDGPUInstCounter &C : Counters)
+    if (C.getEvents().contains(Event))
+      return &C;
+  return nullptr;
+}
+
 } // namespace llvm::AMDGPU

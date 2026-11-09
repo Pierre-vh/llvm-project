@@ -10,6 +10,7 @@
 #define LLVM_LIB_TARGET_AMDGPU_AMDGPUWAITCNTUTILS_H
 
 #include "AMDGPUHWEvents.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -178,6 +179,18 @@ public:
   LLVM_DUMP_METHOD void dump() const;
 #endif
 
+  bool operator==(const Waitcnt& Other) const {
+    for (InstCounterType T : inst_counter_types()) {
+      if (Cnt[T] != Other.Cnt[T])
+        return false;
+    }
+    return true;
+  }
+
+  bool operator!=(const Waitcnt& Other) const {
+    return !(*this == Other);
+  }
+
   friend raw_ostream &operator<<(raw_ostream &OS, const AMDGPU::Waitcnt &Wait) {
     Wait.print(OS);
     return OS;
@@ -276,6 +289,17 @@ getCounters(const GCNSubtarget &ST, bool IsExpertMode);
 /// \p MF.
 SmallVector<AMDGPUInstCounter, NUM_INST_CNTS>
 getCounters(const MachineFunction &MF);
+
+/// \returns the counter of type \p T in \p Counters (typically the result of
+/// getCounters()).
+/// \pre \p T is available, i.e. present in \p Counters.
+const AMDGPUInstCounter &getCounter(InstCounterType T,
+                                    ArrayRef<AMDGPUInstCounter> Counters);
+
+/// \returns the type of the counter in \p Counters that tracks \p Event, or
+/// nullptr no counter tracks it.
+const AMDGPUInstCounter*
+getCounterForEvent(HWEvents Event, ArrayRef<AMDGPUInstCounter> Counters);
 
 } // namespace AMDGPU
 

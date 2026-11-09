@@ -19,29 +19,16 @@ using namespace llvm::AMDGPU::eventtracking;
 
 namespace {
 
-static constexpr unsigned CounterLimit = 12;
-
-// These are not accurate, they are simply for testing purposes.
-// We do not need to test every single counter accurately, that is the job
-// of the IR/MIR tests in tests/CodeGen/AMDGPU. We just need enough here
-// to validate that the EventTracker works.
-static constexpr std::array<CounterInfo, 4> GFX12CounterInfos = {{
-    {LOAD_CNT, HWEvents::VMEM_READ_ACCESS, CounterLimit},
-    {DS_CNT, HWEvents::LDS_ACCESS, CounterLimit},
-    {EXP_CNT, HWEvents::EXP_GPR_LOCK, CounterLimit},
-    {STORE_CNT, HWEvents::VMEM_WRITE_ACCESS | HWEvents::SCRATCH_WRITE_ACCESS,
-     CounterLimit},
-}};
-
 class AMDGPUGFX12EventTrackingTest : public AMDGPUCodeGenTestBase {
 public:
   void SetUp() override {
     setUpImpl("amdgpu12.00-amd-amdhsa", "", "");
 
     TrackerGetter = [&](const MachineBasicBlock &MBB) -> EventTracker & {
+      const GCNSubtarget &ST = MBB.getParent()->getSubtarget<GCNSubtarget>();
       auto &Entry = Trackers[&MBB];
       if (!Entry)
-        Entry = std::make_unique<EventTracker>(MBB, GFX12CounterInfos);
+        Entry = std::make_unique<EventTracker>(MBB, getCounters(ST, /*IsExpertMode=*/false));
       return *Entry;
     };
   }

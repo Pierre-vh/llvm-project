@@ -9,6 +9,7 @@
 #include "AMDGPUEventTracking.h"
 #include "AMDGPUHWEvents.h"
 #include "AMDGPUWaitcntUtils.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -52,11 +53,13 @@ LLVM_DUMP_METHOD void EventTrackerRecord::dump() const {
 #endif
 
 EventTracker::EventTracker(const MachineBasicBlock &MBB,
-                           ArrayRef<CounterInfo> CounterInfos)
+                           ArrayRef<AMDGPUInstCounter> CounterInfos)
     : MBB(&MBB) {
-  Counters.resize(CounterInfos.size());
-  for (const CounterInfo &Info : CounterInfos)
-    Counters[Info.CounterT].CI = &Info;
+  /// TODO: Should be more compact; use the size of CounterInfos instead.
+  /// All addressing of the Counters array needs to change.
+  Counters.resize(NUM_INST_CNTS);
+  for (const AMDGPUInstCounter &IC : CounterInfos)
+    Counters[IC.getType()].IC = &IC;
 }
 
 void EventTracker::enterBlock(GetEventTrackerFn EventTrackerGetter) {
@@ -95,7 +98,7 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
   EventTrackerRecord Rec = EventTrackerRecord(&MI, Event);
   [[maybe_unused]] bool FoundMatch = false;
   for (CounterData &CD : Counters) {
-    if (!CD.CI->Events.contains(Event))
+    if (!CD.IC || !CD.IC->getEvents().contains(Event))
       continue;
 
     FoundMatch = true;
@@ -167,6 +170,19 @@ void EventTracker::drain(InstCounterType T, unsigned N) {
 #ifdef EXPENSIVE_CHECKS
   verify();
 #endif
+}
+
+bool EventTracker::operator==(const EventTracker &Other) const {
+  assert(Counters.size() == Other.Counters.size());
+  // Timelines are kept sorted by compareRecords, which is a strict total order
+  // on the records of a timeline (verify() rejects duplicate identities at the
+  // same age), so an element-wise compare is exact.
+  for (const auto &[A, B] : zip_equal(Counters, Other.Counters)) {
+    assert(A.IC == B.IC && "comparing trackers with different counters");
+    if (A.Count != B.Count || A.Timeline != B.Timeline)
+      return false;
+  }
+  return true;
 }
 
 unsigned EventTracker::count(InstCounterType T) const {
@@ -250,7 +266,7 @@ void EventTracker::print(raw_ostream &OS, bool IgnoreEmpty,
 
   OS << '\n';
   for (const CounterData &C : Counters) {
-    if (IgnoreEmpty && C.Count == 0)
+    if (!C.IC || (IgnoreEmpty && C.Count == 0))
       continue;
     print(OS, C, Indent + 2);
   }
@@ -311,11 +327,13 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
   // Iterate over all counters that are available to us.
   for (CounterData &CData : Counters) {
     assert(CData.Timeline.empty());
+    if (!CData.IC)
+      continue;
 
     DenseMap<hash_code, EventTrackerRecord> Acc;
 
     for (EventTracker *Pred : Preds) {
-      auto &PredCData = Pred->Counters[CData.CI->CounterT];
+      auto &PredCData = Pred->Counters[CData.IC->getType()];
 
       // The merged count is the max across predecessors.
       CData.Count = std::max(CData.Count, PredCData.Count);
@@ -352,8 +370,7 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
 
 void EventTracker::print(raw_ostream &OS, const CounterData &CD,
                          unsigned Indent) {
-  OS.indent(Indent) << getInstCounterName(CD.CI->CounterT)
-                    << " (Count=" << CD.Count
+  OS.indent(Indent) << CD.IC->getName() << " (Count=" << CD.Count
                     << ", Timeline=" << CD.Timeline.size() << ")\n";
   for (const EventTrackerRecord &E : CD.Timeline) {
     OS.indent(Indent + 2);

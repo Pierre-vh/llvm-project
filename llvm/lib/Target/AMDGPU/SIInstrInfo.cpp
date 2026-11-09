@@ -4824,6 +4824,12 @@ bool SIInstrInfo::mayAccessVMEMThroughFlat(const MachineInstr &MI) const {
   return false;
 }
 
+bool SIInstrInfo::mayAccessVMEMAndLDSThroughFlat(const MachineInstr &MI,
+                                                  bool TgSplit) const {
+  return isFLAT(MI) && MI.mayLoadOrStore() && !isLDSDMA(MI) &&
+         mayAccessVMEMThroughFlat(MI) && mayAccessLDSThroughFlat(MI, TgSplit);
+}
+
 bool SIInstrInfo::mayAccessLDSThroughFlat(const MachineInstr &MI,
                                           bool TgSplit) const {
   assert(isFLAT(MI));

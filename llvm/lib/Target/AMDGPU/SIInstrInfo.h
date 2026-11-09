@@ -770,6 +770,14 @@ public:
   /// \returns true for FLAT instructions that can access LDS.
   bool mayAccessLDSThroughFlat(const MachineInstr &MI, bool TgSplit) const;
 
+  /// \returns true if \p MI is a memory access through a flat pointer that may
+  /// reach both VMEM and LDS. Unlike the helpers above, \p MI does not need to
+  /// be a FLAT instruction. LDS DMA instructions are excluded: they use the
+  /// FLAT encoding and access both VMEM and LDS, but through two separate
+  /// addresses, not a flat pointer.
+  bool mayAccessVMEMAndLDSThroughFlat(const MachineInstr &MI,
+                                      bool TgSplit) const;
+
   static bool isBlockLoadStore(uint32_t Opcode) {
     switch (Opcode) {
     case AMDGPU::SI_BLOCK_SPILL_V1024_SAVE:
@@ -873,6 +881,27 @@ public:
     return isLDSDMA(MI) && Opc != AMDGPU::BUFFER_STORE_LDS_DWORD &&
            Opc != AMDGPU::TENSOR_STORE_FROM_LDS_d2 &&
            Opc != AMDGPU::TENSOR_STORE_FROM_LDS_d4;
+  }
+
+  /// \returns true if \p MI is an LDS DMA instruction that executes
+  /// asynchronously: it either uses ASYNC_CNT or has its IsAsync operand set.
+  bool isAsyncLDSDMA(const MachineInstr &MI) const {
+    if (!isLDSDMA(MI))
+      return false;
+    if (usesASYNC_CNT(MI))
+      return true;
+    const MachineOperand *Async = getNamedOperand(MI, AMDGPU::OpName::IsAsync);
+    return Async && Async->getImm();
+  }
+
+  /// \returns true if \p MI writes LDS through a synchronous DMA.
+  bool isNonAsyncLdsDmaWrite(const MachineInstr &MI) const {
+    return mayWriteLDSThroughDMA(MI) && !isAsyncLDSDMA(MI);
+  }
+
+  /// \returns true if \p MI writes LDS through an asynchronous DMA.
+  bool isAsyncLdsDmaWrite(const MachineInstr &MI) const {
+    return mayWriteLDSThroughDMA(MI) && isAsyncLDSDMA(MI);
   }
 
   static bool isSBarrierSCCWrite(unsigned Opcode) {

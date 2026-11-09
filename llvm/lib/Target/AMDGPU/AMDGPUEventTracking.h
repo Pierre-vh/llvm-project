@@ -49,25 +49,6 @@ namespace eventtracking {
 
 class EventTracker;
 
-/// FIXME: Move this to a common file and make it a generic utility.
-///
-/// Represents target-specific information about an available
-/// \ref InstCounterType. This information is constant and inferred from the
-/// subtarget.
-struct CounterInfo {
-  CounterInfo() = default;
-
-  constexpr CounterInfo(InstCounterType T, HWEvents Events, unsigned Limit)
-      : CounterT(T), Events(Events), Limit(Limit) {}
-
-  /// Type of counter this is.
-  InstCounterType CounterT;
-  /// HWEvents that increment this counter.
-  HWEvents Events;
-  /// Hardware limit for this counter.
-  unsigned Limit;
-};
-
 /// Represents a record within the \ref EventTracker's timeline
 /// for one \ref InstCounterType. A record is a pair of \ref MachineInstr
 /// and \ref SingleHWEvent with an age in the timeline.
@@ -124,6 +105,10 @@ public:
   /// \returns the "identity" of this record, which is a hash of its kind and
   /// MI.
   hash_code getIdentity() const;
+
+  bool operator==(const EventTrackerRecord &Other) const {
+    return MI == Other.MI && Kind == Other.Kind && Age == Other.Age;
+  }
 
 private:
   friend class EventTracker;
@@ -184,7 +169,7 @@ public:
   /// [0, CounterInfos.size()), and must outlive this class as its elements are
   /// stored by reference.
   EventTracker(const MachineBasicBlock &MBB,
-               ArrayRef<CounterInfo> CounterInfos);
+               ArrayRef<AMDGPUInstCounter> CounterInfos);
 
   /// Prepare this EventTracker for iteration through its basic block.
   ///
@@ -211,6 +196,7 @@ public:
   unsigned count(InstCounterType T) const;
 
   /// \returns the set of pending HWEvents for \p T.
+  /// FIXME: Should be cached
   HWEvents getPendingEvents(InstCounterType T) const;
 
   /// \returns the current timeline for \p T, which contains all known in-flight
@@ -219,6 +205,11 @@ public:
   /// The returned ArrayRef is invalidated whenever the timeline changes (e.g.
   /// \ref record, \ref drain, \ref enterBlock).
   ArrayRef<EventTrackerRecord> getTimeline(InstCounterType T) const;
+
+  /// \returns true if \p Other tracks the same state: for every counter, the
+  /// same count and the same timeline (records compared by MI, kind and age).
+  /// The tracked MBB is not compared.
+  bool operator==(const EventTracker &Other) const;
 
   /// Prints a dump of the internal tracking state of this class for \p T to the
   /// stream \p OS.
@@ -243,7 +234,7 @@ private:
   /// \ref EventTrackerRecord at this time. However, if this becomes complex
   /// enough, we could clean it up and expose it if it leads to a better API.
   struct CounterData {
-    const CounterInfo *CI = nullptr;
+    const AMDGPUInstCounter *IC = nullptr;
 
     SmallVector<EventTrackerRecord, 16> Timeline;
 
