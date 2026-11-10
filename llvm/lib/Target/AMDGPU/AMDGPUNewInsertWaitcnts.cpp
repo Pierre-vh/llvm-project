@@ -103,7 +103,8 @@ public:
 
   /// Computes the waits of every block into \p Sol without modifying the MIR.
   void solve(Solution &Sol);
-  /// Emits the waits in \p Sol into the MIR, rewriting the preceding waits of each decision point.
+  /// Emits the waits in \p Sol into the MIR, rewriting the preceding waits of
+  /// each decision point.
   /// \returns true if the MIR changed.
   bool apply(const Solution &Sol);
 
@@ -135,8 +136,7 @@ private:
   /// \p MI is null): the preceding waits \p Preceding (soft ones simplified),
   /// \p ExtraWait, and the waits \p MI requires.
   Waitcnt getWaitsBefore(const State &S, const MachineInstr *MI,
-                         const PrecedingWaits &Preceding,
-                         Waitcnt ExtraWait);
+                         const PrecedingWaits &Preceding, Waitcnt ExtraWait);
   /// \returns the waits \p MI requires in state \p S: its dependencies on
   /// pending records, and the counters that must be empty before it.
   Waitcnt getWaitsRequiredBy(const State &S, const MachineInstr &MI);
@@ -254,7 +254,7 @@ private:
   const IsaVersion IV;
 
   /// Counter that tracks SMEM_ACCESS (DS_CNT pre-gfx12, KM_CNT after).
-  const AMDGPUInstCounter* SmemCounter = nullptr;
+  const AMDGPUInstCounter *SmemCounter = nullptr;
 
   WaitcntRPOInfo RPO;
   PassOptions Opts;
@@ -421,10 +421,10 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsAtEnd(
   return W;
 }
 
-Waitcnt
-AMDGPUNewInsertWaitcnts::getWaitsBefore(const State &S, const MachineInstr *MI,
-                                        const PrecedingWaits &Preceding,
-                                        Waitcnt ExtraWait) {
+Waitcnt AMDGPUNewInsertWaitcnts::getWaitsBefore(const State &S,
+                                                const MachineInstr *MI,
+                                                const PrecedingWaits &Preceding,
+                                                Waitcnt ExtraWait) {
   Waitcnt W = Preceding.CombinedWaits;
 
   for (const Waitcnt &Soft : Preceding.SoftWaits) {
@@ -502,11 +502,10 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsRequiredBy(const State &S,
   // VCCZ bug: a VCCZ-reading branch waits for pending SMEM (SIW:2578-2581).
   if (SIInstrInfo::isCBranchVCCZRead(MI) && ST.hasReadVCCZBug()) {
     assert(SmemCounter && "no counter tracks SMEM");
-    waitForMatchingRecords(W, S, SmemCounter->getType(), /*DrainAll=*/false,
-                           [](const auto &R) {
-                             return HWEvents(R.getKind()) ==
-                                    HWEvents::SMEM_ACCESS;
-                           });
+    waitForMatchingRecords(
+        W, S, SmemCounter->getType(), /*DrainAll=*/false, [](const auto &R) {
+          return HWEvents(R.getKind()) == HWEvents::SMEM_ACCESS;
+        });
   }
 
   return W;
@@ -755,7 +754,8 @@ bool AMDGPUNewInsertWaitcnts::hasMemDependencyOn(const MachineInstr &MI,
   // dependent map of loaded addresses (SLoadAddresses) and forces a wait
   // whenever the address matches, even if the load has completed. Here only
   // pending loads match. The wait still goes to 0, since SMEM is out of order.
-  if (T == SmemCounter->getType() && TII.isSMRD(P) && mayStoreToLoadedAddress(MI, P))
+  if (T == SmemCounter->getType() && TII.isSMRD(P) &&
+      mayStoreToLoadedAddress(MI, P))
     return true;
 
   return false;
@@ -821,7 +821,11 @@ Waitcnt AMDGPUNewInsertWaitcnts::simplify(const State &S, Waitcnt W) const {
   if (OptNone)
     return W;
 
-  return removeVmemInvOnlyWait(S, removeNoOpWaits(S, W));
+  W = removeNoOpWaits(S, W);
+  // On GFX12+, we must preserve the waits after cache inv/wbs for correctness.
+  if (!ST.hasExtendedWaitCounts())
+    W = removeVmemInvOnlyWait(S, W);
+  return W;
 }
 
 Waitcnt AMDGPUNewInsertWaitcnts::removeVmemInvOnlyWait(const State &S,
@@ -1010,8 +1014,8 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
   // instruction that is neither a wait nor a meta instruction, or the end of
   // the block if there is none. This matches the old pass, which inserts
   // S_WAITCNT 0 before the first non-meta instruction (SIW:3492-3494): any wait
-  // already there joins the same preceding waits. It is not simplified: it waits for the
-  // caller's unknown operations.
+  // already there joins the same preceding waits. It is not simplified: it
+  // waits for the caller's unknown operations.
   bool NeedsEntryWait = IsEntryWithWaits;
 
   for (MachineInstr &MI : MBB.instrs()) {
@@ -1087,8 +1091,8 @@ bool AMDGPUNewInsertWaitcnts::apply(const Solution &Sol) {
     if (!BS)
       continue;
 
-    // Rewriting only touches the preceding waits of MI and inserts before MI, so the
-    // iteration is not invalidated.
+    // Rewriting only touches the preceding waits of MI and inserts before MI,
+    // so the iteration is not invalidated.
     for (MachineInstr &MI : make_early_inc_range(MBB.instrs())) {
       auto It = BS->Before.find(&MI);
       if (It != BS->Before.end())
@@ -1102,13 +1106,14 @@ bool AMDGPUNewInsertWaitcnts::apply(const Solution &Sol) {
 }
 
 #ifndef NDEBUG
-void AMDGPUNewInsertWaitcnts::checkRewrite(
-    const WaitcntRewriter &Rewriter, MachineBasicBlock &MBB,
-    MachineBasicBlock::instr_iterator It, const Waitcnt &W) const {
-  // The rewritten preceding waits must wait for exactly W. A VINTERP's original waitexp may
-  // be stronger than W on EXP_CNT. Encodings have no "no wait" value: a field
-  // left alone decodes to the counter limit, which never blocks, so values at
-  // or above the limit compare equal to ~0u.
+void AMDGPUNewInsertWaitcnts::checkRewrite(const WaitcntRewriter &Rewriter,
+                                           MachineBasicBlock &MBB,
+                                           MachineBasicBlock::instr_iterator It,
+                                           const Waitcnt &W) const {
+  // The rewritten preceding waits must wait for exactly W. A VINTERP's original
+  // waitexp may be stronger than W on EXP_CNT. Encodings have no "no wait"
+  // value: a field left alone decodes to the counter limit, which never blocks,
+  // so values at or above the limit compare equal to ~0u.
   Waitcnt Got = Rewriter.decodePrecedingWaits(MBB, It);
   bool IsVINTERP = It != MBB.instr_end() && SIInstrInfo::isVINTERP(*It);
   for (const AMDGPUInstCounter &IC : InstCounters) {

@@ -121,8 +121,7 @@ bool isNextNonMetaEndpgm(MachineBasicBlock &MBB,
   }
 }
 
-bool trackedRegsOverlap(const SIRegisterInfo &TRI, MCRegister A,
-                        MCRegister B) {
+bool trackedRegsOverlap(const SIRegisterInfo &TRI, MCRegister A, MCRegister B) {
   if (!A.isValid() || !B.isValid())
     return false;
   if (A == AMDGPU::SCC || B == AMDGPU::SCC)
@@ -160,8 +159,8 @@ MCRegister getOther16BitHalf(const SIRegisterInfo &TRI, MCRegister Reg) {
     return MCRegister();
 
   MCRegister Reg32 = TRI.get32BitRegister(Reg);
-  return TRI.getSubReg(Reg32, isHi16Reg(Reg, TRI) ? AMDGPU::lo16
-                                                  : AMDGPU::hi16);
+  return TRI.getSubReg(Reg32,
+                       isHi16Reg(Reg, TRI) ? AMDGPU::lo16 : AMDGPU::hi16);
 }
 
 void getEXPCntLockedOperands(const SIInstrInfo &TII, const SIRegisterInfo &TRI,
@@ -238,6 +237,14 @@ void getOperandsTrackedByCounter(const SIInstrInfo &TII,
     return;
   }
 
+  // Track implicit SCC operand from S_BARRIER instructions.
+  if (T == KM_CNT && SIInstrInfo::isSBarrierSCCWrite(MI.getOpcode())) {
+    if (const MachineOperand *SCCDef =
+            MI.findRegisterDefOperand(AMDGPU::SCC, /*TRI=*/nullptr))
+      Ops.push_back(SCCDef);
+    return;
+  }
+
   const bool VectorOnly = T == LOAD_CNT || T == SAMPLE_CNT || T == BVH_CNT;
   for (const MachineOperand &Def : MI.defs()) {
     if (!VectorOnly || TRI.isVectorRegister(MRI, Def.getReg()))
@@ -260,8 +267,7 @@ bool mayAccessLDSWrittenByDMA(AAResults *AA, const MachineInstr &MI,
   return AccessesLDS && MI.mayAlias(AA, DMA, /*UseTBAA=*/true);
 }
 
-bool mayStoreToLoadedAddress(const MachineInstr &MI,
-                             const MachineInstr &Load) {
+bool mayStoreToLoadedAddress(const MachineInstr &MI, const MachineInstr &Load) {
   for (const MachineMemOperand *StoreMMO : MI.memoperands()) {
     if (!StoreMMO->isStore())
       continue;
