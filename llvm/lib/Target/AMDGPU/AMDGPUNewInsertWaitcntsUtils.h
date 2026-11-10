@@ -137,6 +137,54 @@ bool mayAccessLDSWrittenByDMA(AAResults *AA, const MachineInstr &MI,
 /// without an IR value are considered the same.
 bool mayStoreToLoadedAddress(const MachineInstr &MI, const MachineInstr &Load);
 
+/// Decides where the "vccz recompute" workaround is needed.
+///
+/// There are two reasons why vccz (the hardware "vcc == 0" bit read by
+/// S_CBRANCH_VCCZ/VCCNZ) might be stale; see
+/// \ref GCNSubtarget::hasReadVCCZBug() and
+/// \ref GCNSubtarget::partialVCCWritesUpdateVCCZ():
+///  i.  CI/SI hardware bug: an SMEM load may complete and corrupt vccz at any
+///      time. Before a vccz read, all pending SMEM must be waited for (handled
+///      by the solver) and vccz recomputed.
+///  ii. On targets before GFX10, a partial write to vcc (VCC_LO or VCC_HI) does
+///      not update vccz. No wait is needed, only the recompute.
+/// Recomputing is done by writing vcc back to itself (see \ref
+/// emitVCCZRecompute).
+///
+/// Usage: create one tracker per basic block walk and call visit() on every
+/// instruction of the block, in order, that is neither a wait nor a meta
+/// instruction. The tracker only carries intra-block state.
+/// It starts every block assuming vccz may be stale (a predecessor may have
+/// written vcc and then issued an SMEM load), so there is nothing to join
+/// across blocks and no fixpoint concern: the result is a pure function of the
+/// block's instructions plus, for the bug (i) half, "is an SMEM pending".
+class VCCZRecomputeTracker {
+public:
+  VCCZRecomputeTracker(const GCNSubtarget &ST, const SIInstrInfo &TII);
+
+  /// Updates the tracked state for \p MI.
+  /// \param MI the MachineInstr
+  /// \param HasPendingSMEM True if there is an outstanding SMEM_ACCESS event.
+  /// \pre this assumes \p MI has already been analyzed, so if \p MI is the one
+  /// to cause the SMEM_ACCESS event, it should set \p HasPendingSMEM.
+  /// \returns true if a vccz recompute must be emitted right before \p MI,
+  bool visit(const MachineInstr &MI, bool HasPendingSMEM);
+
+private:
+  const SIInstrInfo &TII;
+  bool VCCZCorruptionBug;
+  bool VCCZNotUpdatedByPartialWrites;
+  bool MustRecomputeVCCZ = true;
+};
+
+/// Emits the vccz recompute (`vcc = S_MOV vcc`, with the wave-size appropriate
+/// opcode) right before \p InsertBefore. Any write to vcc updates vccz, so
+/// writing back the value just read restores it.
+void emitVCCZRecompute(MachineBasicBlock &MBB,
+                       MachineBasicBlock::instr_iterator InsertBefore,
+                       const GCNSubtarget &ST, const SIInstrInfo &TII,
+                       const SIRegisterInfo &TRI);
+
 /// Represents a solution found by the solver for a MachineFunction.
 /// The solver does not mutate the code at all, it creates these objects which
 /// are then applied to the code.
@@ -158,10 +206,16 @@ public:
     // Same as NopAfterWait, for AtEnd (S_ENDPGM in a later block).
     bool NopAfterAtEnd = false;
 
+    // Instructions (S_CBRANCH_VCCZ/VCCNZ) before which vccz must be recomputed
+    // (see VCCZRecomputeTracker). Emitted after the waits of the instruction,
+    // so that it ends up between the wait and the branch.
+    DenseSet<const MachineInstr *> RecomputeVCCZBefore;
+
     bool operator==(const BasicBlockSolution &Other) const {
       return Before == Other.Before && AtEnd == Other.AtEnd &&
              NopAfterWait == Other.NopAfterWait &&
-             NopAfterAtEnd == Other.NopAfterAtEnd;
+             NopAfterAtEnd == Other.NopAfterAtEnd &&
+             RecomputeVCCZBefore == Other.RecomputeVCCZBefore;
     }
   };
 

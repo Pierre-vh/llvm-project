@@ -134,6 +134,9 @@ private:
   /// loads (LOADCNT/vmcnt) at the end of \p MBB.
   bool shouldFlushPreheader(const State &S, const MachineBasicBlock &MBB);
 
+  /// \returns true if \p S has an outstanding SMEM_ACCESS event.
+  bool hasPendingSMEM(const State &S) const;
+
   /// \returns the waits needed at the end of \p MBB, taking into account
   /// pre-header flushing (see \ref shouldFlushPreheader) if necessary. If \p
   /// MBB is in \p ForceDrain, all InstCounters will be drained.
@@ -1028,7 +1031,9 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
   if (IsEntryWithWaits)
     setStateOnFunctionEntryOrReturn(S);
 
-  // TODO: VCCZ schtuff
+  // Per-walk, intra-block state: starts "vccz may be stale" at every block
+  // entry, like the old pass (see VCCZRecomputeTracker).
+  VCCZRecomputeTracker VCCZ(ST, TII);
 
   PrecedingWaits Preceding;
   PendingWaitAfter PWA;
@@ -1073,6 +1078,15 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
     }
 
     recordEvents(S, MI);
+
+    // Must come after recordEvents and applyWait: the old pass looks at the
+    // state after MI was processed (and after its wait, which for a
+    // vccz-reading branch drains the pending SMEM on bugged targets). Tracked
+    // on every visit, but only recorded (like the waits) when building the
+    // solution.
+    if (VCCZ.visit(MI, hasPendingSMEM(S)) && Sol)
+      (*Sol)[MBB].RecomputeVCCZBefore.insert(&MI);
+
     Preceding = {};
     PWA = {removeNoOpWaits(S, getWaitsForcedAfter(MI)),
            TII.isAlwaysGDS(MI.getOpcode())};
@@ -1097,6 +1111,20 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
   }
 
   // assert(C.W == Waitcnt() && "forced-after wait on a terminator");
+}
+
+bool AMDGPUNewInsertWaitcnts::hasPendingSMEM(const State &S) const {
+  // Port of ScoreBrackets.hasPendingEvent(SMEM_ACCESS). The SMEM counter also
+  // tracks other events (LDS on gfx9, for instance), so look at the kind of
+  // the records. A record disappears from the timeline when a wait drains it,
+  // so this is "has an SMEM that was not waited for".
+  // [unverified] Records pruned from in-order counters by drainCappedRecords
+  // (T3) are treated as completed; SMEM is out-of-order, so none are pruned.
+  assert(SmemCounter && "no counter tracks SMEM");
+  return any_of(S.ET.getTimeline(SmemCounter->getType()),
+                [](const EventTrackerRecord &R) {
+                  return HWEvents(R.getKind()) == HWEvents::SMEM_ACCESS;
+                });
 }
 
 bool AMDGPUNewInsertWaitcnts::apply(const Solution &Sol) {
@@ -1126,6 +1154,13 @@ bool AMDGPUNewInsertWaitcnts::apply(const Solution &Sol) {
       if (It != BS->Before.end())
         Rewrite(MBB, MI.getIterator(), It->second,
                 BS->NopAfterWait.contains(&MI));
+
+      // After the rewrite, so the recompute lands between the waits and MI
+      // like in the old pass (waits are inserted first, vccz recompute second).
+      if (BS->RecomputeVCCZBefore.contains(&MI)) {
+        emitVCCZRecompute(MBB, MI.getIterator(), ST, TII, TRI);
+        Modified = true;
+      }
     }
     if (BS->AtEnd)
       Rewrite(MBB, MBB.instr_end(), *BS->AtEnd, BS->NopAfterAtEnd);

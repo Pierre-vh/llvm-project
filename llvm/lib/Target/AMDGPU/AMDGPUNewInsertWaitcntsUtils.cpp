@@ -400,6 +400,67 @@ void WaitcntLoopPreheaderInfo::init() {
   }
 }
 
+VCCZRecomputeTracker::VCCZRecomputeTracker(const GCNSubtarget &ST,
+                                           const SIInstrInfo &TII)
+    : TII(TII), VCCZCorruptionBug(ST.hasReadVCCZBug()),
+      VCCZNotUpdatedByPartialWrites(!ST.partialVCCWritesUpdateVCCZ()) {}
+
+bool VCCZRecomputeTracker::visit(const MachineInstr &MI, bool HasPendingSMEM) {
+  if (!VCCZCorruptionBug && !VCCZNotUpdatedByPartialWrites)
+    return false; // nothing to do
+
+  // An SMEM load may complete at any time and corrupt vccz.
+  MustRecomputeVCCZ |= VCCZCorruptionBug && TII.isSMRD(MI);
+
+  // A partial write to vcc does not update vccz on this target.
+  // PartialWrite is computed lazily: definesRegister() is not cheap and this
+  // runs on every instruction of the function.
+  std::optional<bool> PartialWrite;
+  auto PartiallyWritesVCC = [&MI] {
+    return MI.definesRegister(AMDGPU::VCC_LO, /*TRI=*/nullptr) ||
+           MI.definesRegister(AMDGPU::VCC_HI, /*TRI=*/nullptr);
+  };
+
+  if (VCCZNotUpdatedByPartialWrites) {
+    PartialWrite = PartiallyWritesVCC();
+    MustRecomputeVCCZ |= *PartialWrite;
+  }
+
+  // A write to vcc clears the flag, unless it may still be corrupted by a
+  // pending SMEM load (only possible on targets with the corruption bug).
+  if (!HasPendingSMEM || !VCCZCorruptionBug) {
+    if (!PartialWrite)
+      PartialWrite = PartiallyWritesVCC();
+    bool FullWrite =
+        !*PartialWrite && MI.definesRegister(AMDGPU::VCC, /*TRI=*/nullptr);
+    // vccz is correct after a full write, or after a partial one if the target
+    // updates vccz on partial writes.
+    if (FullWrite || (!VCCZNotUpdatedByPartialWrites && *PartialWrite))
+      MustRecomputeVCCZ = false;
+  }
+
+  if (SIInstrInfo::isCBranchVCCZRead(MI) && MustRecomputeVCCZ) {
+    MustRecomputeVCCZ = false;
+    return true;
+  }
+
+  return false;
+}
+
+void emitVCCZRecompute(MachineBasicBlock &MBB,
+                       MachineBasicBlock::instr_iterator InsertBefore,
+                       const GCNSubtarget &ST, const SIInstrInfo &TII,
+                       const SIRegisterInfo &TRI) {
+  // Any write to vcc updates vccz, so reading vcc and writing it back restores
+  // the bit.
+  DebugLoc DL = InsertBefore != MBB.instr_end() ? InsertBefore->getDebugLoc()
+                                                : DebugLoc();
+  BuildMI(MBB, InsertBefore, DL,
+          TII.get(ST.isWave32() ? AMDGPU::S_MOV_B32 : AMDGPU::S_MOV_B64),
+          TRI.getVCC())
+      .addReg(TRI.getVCC());
+}
+
 void PrecedingWaits::add(MachineInstr &MI, const IsaVersion &IV) {
   assert(isWaitInstr(MI));
 
