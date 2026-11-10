@@ -357,7 +357,47 @@ void WaitcntLoopPreheaderInfo::init() {
   const SIRegisterInfo &TRI = *ST.getRegisterInfo();
   const MachineRegisterInfo &MRI = MF.getRegInfo();
 
-  // TODO: Spin up new agent with previous context to implement this.
+  for (const MachineLoop *ML : MLI.getLoopsInPreorder()) {
+    Entry &E = Entries[ML];
+    E.HasVMemLoad = false;
+    E.HasVMemStore = false;
+
+    // Units written by VMEM loads in the loop. Kept local: only needed to
+    // derive LoadedValueUsedInLoop.
+    DenseSet<MCRegUnit> VMemLoadDefUnits;
+
+    for (const MachineBasicBlock *MBB : ML->blocks()) {
+      for (const MachineInstr &MI : *MBB) {
+        if (MI.isMetaInstruction())
+          continue;
+
+        if (isVMEMOrFlatVMEM(TII, MI)) {
+          E.HasVMemLoad |= MI.mayLoad();
+          E.HasVMemStore |= MI.mayStore();
+        }
+
+        // Every vector register use (VGPRs and AGPRs).
+        for (const MachineOperand &Op : MI.all_uses()) {
+          if (!TRI.isVectorRegister(MRI, Op.getReg()))
+            continue;
+          for (MCRegUnit RU : TRI.regunits(Op.getReg().asMCReg()))
+            E.UsedVectorUnits.insert(RU);
+        }
+
+        // Units defined by VMEM loads.
+        if (isVMEMOrFlatVMEM(TII, MI) && MI.mayLoad()) {
+          for (const MachineOperand &Op : MI.all_defs()) {
+            for (MCRegUnit RU : TRI.regunits(Op.getReg().asMCReg()))
+              VMemLoadDefUnits.insert(RU);
+          }
+        }
+      }
+    }
+
+    E.LoadedValueUsedInLoop = any_of(VMemLoadDefUnits, [&](MCRegUnit RU) {
+      return E.UsedVectorUnits.contains(RU);
+    });
+  }
 }
 
 void PrecedingWaits::add(MachineInstr &MI, const IsaVersion &IV) {

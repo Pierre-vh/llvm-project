@@ -401,24 +401,15 @@ struct PendingWaitAfter {
 
 bool AMDGPUNewInsertWaitcnts::shouldFlushPreheader(
     const State &S, const MachineBasicBlock &MBB) {
-  // FIXME: Entire function here is AI written; verify logic.
   const WaitcntLoopPreheaderInfo::Entry *L = LoopPreInfo.getPreheaderInfo(MBB);
-  if (!L)
+  if (!L || L->LoadedValueUsedInLoop)
     return false;
 
-  if (L->LoadedValueUsedInLoop) {
+  bool StoreOnlyLoop = !ST.hasVscnt() && L->HasVMemStore && !L->HasVMemLoad;
+  bool LoadsUnused = L->HasVMemLoad && ST.hasVmemWriteVgprInOrder();
+  if (!StoreOnlyLoop && !LoadsUnused)
     return false;
-  }
 
-  bool StoreOnlyLoop =
-      !ST.hasVscnt() && L->HasVMemStore && !L->HasVMemLoad;          // rule 1
-  bool LoadsUnused = L->HasVMemLoad && ST.hasVmemWriteVgprInOrder(); // rule 2
-  if (!StoreOnlyLoop && !LoadsUnused) {
-    return false;
-  }
-
-  // State-dependent half (SIW:3368-3372): a load still in flight writes a
-  // vector unit the loop reads (R8).
   return any_of(S.ET.getTimeline(LOAD_CNT), [&](const EventTrackerRecord &R) {
     return definesAnyRUs(TRI, *R.getMI(), L->UsedVectorUnits);
   });
