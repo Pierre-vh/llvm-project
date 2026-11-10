@@ -748,4 +748,128 @@ body:             |
   EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
 }
 
+/// Check that drainCappedRecords only acts on capped counters, removes exactly
+/// the records whose age is at or above the cap (Limit - 1), and leaves the
+/// count and the younger records untouched.
+TEST_F(AMDGPUGFX12EventTrackingTest, DrainCappedRecords) {
+  StringRef MIR = R"(
+name:            DrainCappedRecords
+body:             |
+  bb.0:
+    liveins: $vgpr4_vgpr5
+
+    $vgpr4 = GLOBAL_LOAD_DWORD $vgpr4_vgpr5, 0, 0, implicit $exec
+    S_ENDPGM 0
+...
+)";
+  ASSERT_TRUE(parseMIR(MIR));
+  MachineFunction &MF = getMF("DrainCappedRecords");
+  MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
+  MachineInstr &Load = BB0.front();
+
+  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
+  auto Counters = getCounters(ST, /*IsExpertMode=*/false);
+  const unsigned Limit = getCounter(AMDGPU::LOAD_CNT, Counters).getLimit();
+  const unsigned Cap = Limit - 1;
+  ASSERT_GT(Limit, 2u);
+
+  EventTracker ET(BB0, Counters);
+  ET.enterBlock(TrackerGetter);
+  const SingleHWEvent Ev = SingleHWEvent::encode(HWEvents::VMEM_READ_ACCESS);
+
+  // Not capped: nothing is removed.
+  for (unsigned I = 0; I < 3; ++I)
+    ET.record(Load, Ev);
+  ASSERT_FALSE(ET.isCapped(AMDGPU::LOAD_CNT));
+  ET.drainCappedRecords(AMDGPU::LOAD_CNT);
+  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), 3u);
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), 3u);
+
+  // Capped, with Extra records at or above the cap.
+  constexpr unsigned Extra = 4;
+  for (unsigned I = 3; I < Cap + Extra; ++I)
+    ET.record(Load, Ev);
+  ASSERT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
+  ASSERT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), Cap + Extra);
+
+  ET.drainCappedRecords(AMDGPU::LOAD_CNT);
+  ArrayRef<EventTrackerRecord> TL = ET.getTimeline(AMDGPU::LOAD_CNT);
+  ASSERT_EQ(TL.size(), Cap);
+  EXPECT_EQ(TL.front().getAge(), Cap - 1);
+  EXPECT_EQ(TL.back().getAge(), 0u);
+  // The hardware counter stays saturated: the count is not lowered.
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Cap);
+  EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
+
+  // Idempotent.
+  ET.drainCappedRecords(AMDGPU::LOAD_CNT);
+  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), Cap);
+
+  // One more event ages the oldest record to the cap; it is removed again.
+  ET.record(Load, Ev);
+  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).front().getAge(), Cap);
+  ET.drainCappedRecords(AMDGPU::LOAD_CNT);
+  TL = ET.getTimeline(AMDGPU::LOAD_CNT);
+  EXPECT_EQ(TL.size(), Cap);
+  EXPECT_EQ(TL.front().getAge(), Cap - 1);
+
+  // Other counters are unaffected.
+  ET.drainCappedRecords(AMDGPU::STORE_CNT);
+  EXPECT_TRUE(TrackerRecordsChecker(ET, AMDGPU::STORE_CNT).unused());
+}
+
+/// Check that widenCount raises the count to the cap without touching the
+/// timeline, that later events don't push the count further, and that it does
+/// nothing on a counter the target lacks.
+TEST_F(AMDGPUGFX12EventTrackingTest, WidenCount) {
+  StringRef MIR = R"(
+name:            WidenCount
+body:             |
+  bb.0:
+    liveins: $vgpr4_vgpr5
+
+    $vgpr4 = GLOBAL_LOAD_DWORD $vgpr4_vgpr5, 0, 0, implicit $exec
+    S_ENDPGM 0
+...
+)";
+  ASSERT_TRUE(parseMIR(MIR));
+  MachineFunction &MF = getMF("WidenCount");
+  MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
+  MachineInstr &Load = BB0.front();
+
+  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
+  auto Counters = getCounters(ST, /*IsExpertMode=*/false);
+  const unsigned Cap = getCounter(AMDGPU::LOAD_CNT, Counters).getLimit() - 1;
+
+  EventTracker ET(BB0, Counters);
+  ET.enterBlock(TrackerGetter);
+  const SingleHWEvent Ev = SingleHWEvent::encode(HWEvents::VMEM_READ_ACCESS);
+  ET.record(Load, Ev);
+  ET.record(Load, Ev);
+  ASSERT_EQ(ET.count(AMDGPU::LOAD_CNT), 2u);
+
+  EXPECT_TRUE(ET.widenCount(AMDGPU::LOAD_CNT));
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Cap);
+  EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
+  ArrayRef<EventTrackerRecord> TL = ET.getTimeline(AMDGPU::LOAD_CNT);
+  ASSERT_EQ(TL.size(), 2u);
+  EXPECT_EQ(TL[0].getAge(), 1u);
+  EXPECT_EQ(TL[1].getAge(), 0u);
+
+  // Widening twice is a no-op; recording keeps the count at the cap.
+  EXPECT_TRUE(ET.widenCount(AMDGPU::LOAD_CNT));
+  ET.record(Load, Ev);
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Cap);
+  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), 3u);
+
+  // A drain still lowers a widened count.
+  ET.drain(AMDGPU::LOAD_CNT, 1);
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), 1u);
+  EXPECT_FALSE(ET.isCapped(AMDGPU::LOAD_CNT));
+
+  // TENSOR_CNT does not exist on gfx12.00: nothing to widen.
+  EXPECT_FALSE(ET.widenCount(AMDGPU::TENSOR_CNT));
+  EXPECT_EQ(ET.count(AMDGPU::TENSOR_CNT), 0u);
+}
+
 } // namespace

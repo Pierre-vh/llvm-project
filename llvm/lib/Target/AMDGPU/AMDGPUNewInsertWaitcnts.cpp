@@ -24,6 +24,7 @@
 #include "AMDGPUNewInsertWaitcntsUtils.h"
 #include "AMDGPUWaitcntRewriter.h"
 #include "GCNSubtarget.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -38,6 +39,8 @@ using namespace llvm::AMDGPU::eventtracking;
 
 #define DEBUG_TYPE "amdgpu-new-insert-waitcnts"
 #define PASS_NAME "AMDGPU New Insert Waitcnts"
+
+STATISTIC(NumCounterWidened, "Number of counters widened in retreating MBBs");
 
 namespace {
 
@@ -320,21 +323,26 @@ void AMDGPUNewInsertWaitcnts::solve(Solution &Sol) {
 
   RPOWorklist WL(RPO);
   while (MachineBasicBlock *MBB = WL.pop()) {
+    const bool IsRetreating = RPO.getRetreatingBlocks().contains(MBB);
     State Old = OutStates.at(MBB);
     // The last visit always wins, so preemptively clear the solution.
     Sol.forget(*MBB);
 
     walkBlock(*MBB, OutStates, ForceDrain, &Sol);
+    State &New = OutStates.at(MBB);
 
-    // TODO: We should do something about loops here. Claude says to do:
-    //
-    //    if (RetreatingSources.contains(MBB)) {
-    //      widenCounts(Out.at(MBB), Old);                 // D9
-    //    }
-    //
-    // But I am not confident in that. I think a cleaner way is to check that
-    // the TL is the same and only counts increased. If that's the case, then
-    // cap the count to the limit.
+    if (IsRetreating) {
+      for (const AMDGPUInstCounter &IC : InstCounters) {
+        InstCounterType T = IC.getType();
+        // If the timeline is unchanged and only the counter grew, widen the
+        // count to the cap.
+        if ((Old.ET.getTimeline(T) == New.ET.getTimeline(T)) &&
+            (Old.ET.count(T) < New.ET.count(T))) {
+          if (New.ET.widenCount(IC.getType()))
+            ++NumCounterWidened;
+        }
+      }
+    }
 
     if (++Visits > TotalVisitBudget && !WillForceDrain) {
       /// TODO: Move to a helper function? Maybe the entire solver should move
@@ -353,15 +361,14 @@ void AMDGPUNewInsertWaitcnts::solve(Solution &Sol) {
       WillForceDrain = true;
     }
 
-    // Out state is equal to old state, that is a good thing.
-    if (OutStates.at(MBB) == Old) {
+    // Out state is equal to old state; we are getting closer to a fixpoint.
+    if (New == Old)
       continue;
-    }
 
     for (MachineBasicBlock *Succ : MBB->successors()) {
       WL.push(Succ);
 
-      /// TODO: Implement this
+      /// TODO: Implement this ?
       // Nested reset (A.7): a forward edge into a loop header restarts the
       // counters of that loop's retreating sources.
       //
@@ -375,7 +382,7 @@ void AMDGPUNewInsertWaitcnts::solve(Solution &Sol) {
     // If this is a retreating block that isn't marked for force-draining, keep
     // track of how many times we passed over it. Once our budget runs out, mark
     // it for force draining and revisit it.
-    if (RPO.getRetreatingBlocks().contains(MBB) && !ForceDrain.contains(MBB) &&
+    if (IsRetreating && !ForceDrain.contains(MBB) &&
         ++RetreatingMBBChangeCount[MBB] >
             Opts.IterationLimitForRetreatingBlocks) {
       /// TODO: This should be rare as well, diagnose it.
@@ -422,8 +429,18 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsAtEnd(
     const DenseSet<const MachineBasicBlock *> &ForceDrain) {
   Waitcnt W;
 
-  if (ForceDrain.contains(&MBB))
-    W = getAllZeroWaitcnt(/*IncludeStores=*/true); // STORE included (A.5)
+  if (ForceDrain.contains(&MBB)) {
+    // Do not use getAllZeroWaitcnt - this has to be more thorough: drain every
+    // single counter that has even just one event. This is necessary as
+    // ForceDrain is one of the guards that ensure we reach a fixpoint.
+    for (const AMDGPUInstCounter &IC : InstCounters) {
+      InstCounterType T = IC.getType();
+      if (!S.ET.getTimeline(T).empty())
+        W.set(T, 0);
+      else
+        assert(S.ET.count(T) == 0);
+    }
+  }
 
   if (shouldFlushPreheader(S, MBB)) { // recomputed every visit (W7)
     waitForAll(W, S, LOAD_CNT); // vmcnt(0) at the preheader end (SIW:2616-2620)
@@ -884,8 +901,14 @@ void AMDGPUNewInsertWaitcnts::recordEvents(State &S, MachineInstr &MI) {
     return;
   }
 
-  for (HWEvents E : getEventsFor(MI, ST, IsExpertMode, IsTgSplit)) {
+  for (HWEvents E : getEventsFor(MI, ST, IsExpertMode, IsTgSplit))
     S.ET.record(MI, SingleHWEvent::encode(E));
+
+  // For in-order counter, prune all counters above the cap.
+  for (const AMDGPUInstCounter &IC : InstCounters) {
+    if (!isOutOfOrder(S, IC.getType())) {
+      S.ET.drainCappedRecords(IC.getType());
+    }
   }
 
   // if (anyEventOn(MI,

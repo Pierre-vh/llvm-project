@@ -140,6 +140,15 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
 #endif
 }
 
+bool EventTracker::widenCount(InstCounterType T) {
+  CounterData &CD = Counters[T];
+  if (!CD.IC || !CD.IC->hasLimit())
+    return false;
+  CD.Count = CD.IC->getLimit() - 1;
+  assert(isCapped(T));
+  return true;
+}
+
 void EventTracker::drain(InstCounterType T, unsigned N) {
   CounterData &CD = Counters[T];
   LLVM_DEBUG(dbgs() << "[EventTracker] Drain " << getInstCounterName(T)
@@ -195,6 +204,26 @@ HWEvents EventTracker::getPendingEvents(InstCounterType T) const {
   for (const auto &E : Counters[T].Timeline)
     Res |= E.getKind();
   return Res;
+}
+
+void EventTracker::drainCappedRecords(InstCounterType T) {
+  CounterData &CD = Counters[T];
+  if (!isCapped(CD))
+    return;
+
+  // TL is sorted, so iterate from the start to see oldest records, then bail
+  // early.
+  unsigned NumAboveCap = 0;
+  unsigned Cap = CD.IC->getLimit() - 1;
+  for (EventTrackerRecord &R : CD.Timeline) {
+    if (R.getAge() >= Cap)
+      ++NumAboveCap;
+    else
+      break;
+  }
+
+  if (NumAboveCap > 0)
+    CD.Timeline.erase(CD.Timeline.begin(), CD.Timeline.begin() + NumAboveCap);
 }
 
 ArrayRef<EventTrackerRecord>

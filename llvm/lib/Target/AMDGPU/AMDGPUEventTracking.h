@@ -186,6 +186,12 @@ public:
   /// \pre \p Event belongs to at least one \ref InstCounterType.
   void record(MachineInstr &MI, SingleHWEvent Event);
 
+  /// Set the \ref count of \p T to its limit (\ref isCapped returns true).
+  /// The timeline is unaffected. If the counter isn't tracked or has no limit,
+  /// does nothing.
+  /// \returns true if the count was widened, false otherwise.
+  bool widenCount(InstCounterType T);
+
   /// Drains the timeline of \p T such that:
   /// - The \ref count of \p T is no higher than \p N.
   /// - There are no records in the timeline with an age >= \p N.
@@ -203,6 +209,9 @@ public:
   /// counter minus 1), and new events do not increment the counter value
   /// anymore.
   bool isCapped(InstCounterType T) const { return isCapped(Counters[T]); }
+
+  /// Drain all records of \p T that have an age >= the cap of its counter.
+  void drainCappedRecords(InstCounterType T);
 
   /// \returns the current timeline for \p T, which contains all known in-flight
   /// (not drained) records. The timeline is always sorted by descending
