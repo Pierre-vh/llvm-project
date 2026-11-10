@@ -13,6 +13,7 @@
 #include "AMDGPUNewInsertWaitcntsUtils.h"
 #include "GCNSubtarget.h"
 #include "SIInstrInfo.h"
+#include "SIMachineFunctionInfo.h"
 #include "SIRegisterInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -398,6 +399,98 @@ void WaitcntLoopPreheaderInfo::init() {
       return E.UsedVectorUnits.contains(RU);
     });
   }
+}
+
+bool insertScalarStoreCacheFlushes(MachineFunction &MF, const GCNSubtarget &ST,
+                                   const SIInstrInfo &TII) {
+  if (!ST.hasScalarStores())
+    return false;
+
+  // Single scan: remember the terminating blocks and whether any scalar store
+  // exists.
+  SmallVector<MachineBasicBlock *, 4> EndBlocks;
+  bool HaveScalarStores = false;
+  for (MachineBasicBlock &MBB : MF) {
+    for (MachineInstr &MI : MBB) {
+      HaveScalarStores |= TII.isScalarStore(MI);
+      // A block with two terminators is pushed twice which is harmless because
+      // the second visit sees the flush inserted by the first.
+      if (MI.getOpcode() == AMDGPU::S_ENDPGM ||
+          MI.getOpcode() == AMDGPU::SI_RETURN_TO_EPILOG)
+        EndBlocks.push_back(&MBB);
+    }
+  }
+  if (!HaveScalarStores)
+    return false;
+
+  bool Modified = false;
+  for (MachineBasicBlock *MBB : EndBlocks) {
+    // An explicit flush makes later terminators safe until the next scalar
+    // store.
+    bool SeenDCacheWB = false;
+    for (MachineInstr &MI : make_early_inc_range(*MBB)) {
+      if (MI.getOpcode() == AMDGPU::S_DCACHE_WB)
+        SeenDCacheWB = true;
+      else if (TII.isScalarStore(MI))
+        SeenDCacheWB = false;
+
+      if ((MI.getOpcode() == AMDGPU::S_ENDPGM ||
+           MI.getOpcode() == AMDGPU::SI_RETURN_TO_EPILOG) &&
+          !SeenDCacheWB) {
+        BuildMI(*MBB, MI, MI.getDebugLoc(), TII.get(AMDGPU::S_DCACHE_WB));
+        SeenDCacheWB = true;
+        Modified = true;
+      }
+    }
+  }
+  return Modified;
+}
+
+VGPRDeallocMode getVGPRDeallocMode(const MachineFunction &MF,
+                                   const GCNSubtarget &ST,
+                                   const SIRegisterInfo &TRI, bool OptNone) {
+  if (OptNone)
+    return VGPRDeallocMode::None;
+
+  if (MF.getInfo<SIMachineFunctionInfo>()->isDynamicVGPREnabled())
+    return VGPRDeallocMode::Dynamic;
+
+  if (ST.getGeneration() < AMDGPUSubtarget::GFX11)
+    return VGPRDeallocMode::None;
+
+  // Skip if waveslot limited: only deallocate if calls make
+  // the VGPR count unknown, or occupancy is VGPR limited. A short waveslot
+  // limited kernel runs slower with the deallocation.
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  if (MF.getFrameInfo().hasCalls() ||
+      ST.getOccupancyWithNumVGPRs(
+          TRI.getNumUsedPhysRegs(MRI, AMDGPU::VGPR_32RegClass),
+          /*IsDynamicVGPR=*/false) < ST.getMaxWavesPerEU())
+    return VGPRDeallocMode::Message;
+  return VGPRDeallocMode::None;
+}
+
+bool emitVGPRDealloc(MachineInstr &EndPgm, VGPRDeallocMode Mode,
+                     bool SafeToMessage, const GCNSubtarget &ST,
+                     const SIInstrInfo &TII) {
+  MachineBasicBlock &MBB = *EndPgm.getParent();
+  const DebugLoc &DL = EndPgm.getDebugLoc();
+  switch (Mode) {
+  case VGPRDeallocMode::None:
+    return false;
+  case VGPRDeallocMode::Dynamic:
+    BuildMI(MBB, EndPgm, DL, TII.get(AMDGPU::S_ALLOC_VGPR)).addImm(0);
+    return true;
+  case VGPRDeallocMode::Message:
+    if (!SafeToMessage)
+      return false;
+    if (ST.requiresNopBeforeDeallocVGPRs())
+      BuildMI(MBB, EndPgm, DL, TII.get(AMDGPU::S_NOP)).addImm(0);
+    BuildMI(MBB, EndPgm, DL, TII.get(AMDGPU::S_SENDMSG))
+        .addImm(AMDGPU::SendMsg::ID_DEALLOC_VGPRS_GFX11Plus);
+    return true;
+  }
+  llvm_unreachable("covered switch");
 }
 
 VCCZRecomputeTracker::VCCZRecomputeTracker(const GCNSubtarget &ST,

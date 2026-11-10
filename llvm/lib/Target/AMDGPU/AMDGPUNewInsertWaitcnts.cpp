@@ -108,6 +108,11 @@ public:
   bool run();
 
 private:
+  /// Releases the VGPRs before the S_ENDPGM recorded in \p Sol, if the
+  /// function wants it (see \ref getVGPRDeallocMode).
+  /// \returns true if the MIR changed.
+  bool insertVGPRDeallocs(const Solution &Sol);
+
   /// Computes the waits of every block into \p Sol without modifying the MIR.
   void solve(Solution &Sol);
 
@@ -133,6 +138,19 @@ private:
   /// \returns true if \p MBB is a loop preheader, and we must wait for all
   /// loads (LOADCNT/vmcnt) at the end of \p MBB.
   bool shouldFlushPreheader(const State &S, const MachineBasicBlock &MBB);
+
+  /// \returns true if \p MI is S_ENDPGM or S_ENDPGM_SAVED.
+  static bool isEndPgm(const MachineInstr &MI) {
+    return MI.getOpcode() == AMDGPU::S_ENDPGM ||
+           MI.getOpcode() == AMDGPU::S_ENDPGM_SAVED;
+  }
+
+  /// \returns true if sending the dealloc VGPRs message before an S_ENDPGM
+  /// reached with state \p S is safe and useful: some store is in flight (the
+  /// message lets the wave release its VGPRs while waiting for it) and none is
+  /// a scratch store (it still needs its VGPRs). \p PendingForcedWait is the
+  /// forced-after wait of the previous instruction, not applied to \p S yet.
+  bool isSafeToDeallocVGPRs(const State &S, const Waitcnt &PendingForcedWait);
 
   /// \returns true if \p S has an outstanding SMEM_ACCESS event.
   bool hasPendingSMEM(const State &S) const;
@@ -1066,6 +1084,9 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
       Extra = Extra.combined(getWaitsAtEnd(S, MBB, ForceDrain));
     }
 
+    if (Sol && isEndPgm(MI))
+      (*Sol)[MBB].EndPgmSafeToMessage[&MI] = isSafeToDeallocVGPRs(S, PWA.W);
+
     Waitcnt W = getWaitsBefore(S, &MI, Preceding, Extra);
     applyWait(S, W);
     if (Sol) {
@@ -1111,6 +1132,40 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
   }
 
   // assert(C.W == Waitcnt() && "forced-after wait on a terminator");
+}
+
+bool AMDGPUNewInsertWaitcnts::isSafeToDeallocVGPRs(
+    const State &S, const Waitcnt &PendingForcedWait) {
+  // Safe iff some store is in flight and none of them is a scratch store.
+  //
+  // S does not include PendingForcedWait yet. Forced waits are always
+  // all-zero (see \ref getWaitsForcedAfter), so one on STORE_CNT leaves no
+  // store in flight and there is nothing to overlap with.
+  //
+  // The message only exists on gfx11+, where STORE_CNT is always present.
+  if (!ST.hasVscnt())
+    return false;
+
+  // NB: This avoids having to copy the state just to apply the waitcnt.
+  // If we somehow add forced waits that don't waitcnt zero, this is no longer
+  // valid (hence the assert).
+  assert((!PendingForcedWait.hasWaitStoreCnt() ||
+          PendingForcedWait.get(STORE_CNT) == 0) &&
+         "forced waits are expected to be all-zero waits");
+  if (PendingForcedWait.hasWaitStoreCnt())
+    return false;
+
+  // An indeterminate STORE_CNT (stores from the caller / a callee) stands for
+  // the old pass's "unknown stores", which set SCRATCH_WRITE_ACCESS too.
+  if (S.ET.isIndeterminate(STORE_CNT))
+    return false;
+
+  const auto &Timeline = S.ET.getTimeline(STORE_CNT);
+  bool HasStores = S.ET.count(STORE_CNT) > 0 || !Timeline.empty();
+  bool HasScratchStore = any_of(Timeline, [](const EventTrackerRecord &R) {
+    return HWEvents(R.getKind()) == HWEvents::SCRATCH_WRITE_ACCESS;
+  });
+  return HasStores && !HasScratchStore;
 }
 
 bool AMDGPUNewInsertWaitcnts::hasPendingSMEM(const State &S) const {
@@ -1200,11 +1255,34 @@ void AMDGPUNewInsertWaitcnts::verify() {
   // TODO in a future batch of work; not critical for now.
 }
 
+bool AMDGPUNewInsertWaitcnts::insertVGPRDeallocs(const Solution &Sol) {
+  VGPRDeallocMode Mode = getVGPRDeallocMode(MF, ST, TRI, OptNone);
+  if (Mode == VGPRDeallocMode::None)
+    return false;
+
+  bool Modified = false;
+  for (MachineBasicBlock &MBB : MF) {
+    const Solution::BasicBlockSolution *BS = Sol.lookup(MBB);
+    if (!BS)
+      continue; // unreachable, like the old pass
+    for (MachineInstr &MI : make_early_inc_range(MBB.instrs())) {
+      auto It = BS->EndPgmSafeToMessage.find(&MI);
+      if (It != BS->EndPgmSafeToMessage.end())
+        Modified |= emitVGPRDealloc(MI, Mode, It->second, ST, TII);
+    }
+  }
+  return Modified;
+}
+
 bool AMDGPUNewInsertWaitcnts::run() {
   Solution Sol;
 
   solve(Sol);
   bool Modified = apply(Sol);
+
+  // TODO: move to apply
+  Modified |= insertScalarStoreCacheFlushes(MF, ST, TII);
+  Modified |= insertVGPRDeallocs(Sol);
 
   if (Opts.Verify)
     verify();

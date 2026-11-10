@@ -185,6 +185,42 @@ void emitVCCZRecompute(MachineBasicBlock &MBB,
                        const GCNSubtarget &ST, const SIInstrInfo &TII,
                        const SIRegisterInfo &TRI);
 
+/// Inserts S_DCACHE_WB before every S_ENDPGM / SI_RETURN_TO_EPILOG of \p MF
+/// that is not already preceded (in its block) by one, if \p MF contains
+/// scalar stores. Scalar stores are written to the scalar cache, which must be
+/// flushed before the wave terminates, or the next wave reusing the same
+/// scratch memory can be clobbered.
+/// \returns true if the MIR was modified.
+bool insertScalarStoreCacheFlushes(MachineFunction &MF, const GCNSubtarget &ST,
+                                   const SIInstrInfo &TII);
+
+/// How VGPRs are released before the wave ends (see \ref getVGPRDeallocMode).
+enum class VGPRDeallocMode {
+  /// Nothing is emitted.
+  None,
+  /// Dynamic VGPR mode: `S_ALLOC_VGPR 0` before every S_ENDPGM(_SAVED).
+  Dynamic,
+  /// `S_SENDMSG dealloc_vgprs` (preceded by `S_NOP 0` if the target requires
+  /// it) before the S_ENDPGM(_SAVED) that are safe.
+  Message,
+};
+
+/// \returns How \p MF releases its VGPRs before S_ENDPGM.
+VGPRDeallocMode getVGPRDeallocMode(const MachineFunction &MF,
+                                   const GCNSubtarget &ST,
+                                   const SIRegisterInfo &TRI, bool OptNone);
+
+/// Emits the VGPR release for the S_ENDPGM(_SAVED) \p EndPgm, right before it.
+/// \param EndPgm The S_ENDPGM instruction.
+/// \param Mode The dealloc mode provided by \ref getVGPRDeallocMode
+/// \param SafeToMessage Whether sending the dealloc message is safe at \p
+///                      EndPgm (no scratch stores outstanding, but some stores
+///                      in flight). Only consulted in message mode.
+/// \returns true if something was emitted.
+bool emitVGPRDealloc(MachineInstr &EndPgm, VGPRDeallocMode Mode,
+                     bool SafeToMessage, const GCNSubtarget &ST,
+                     const SIInstrInfo &TII);
+
 /// Represents a solution found by the solver for a MachineFunction.
 /// The solver does not mutate the code at all, it creates these objects which
 /// are then applied to the code.
@@ -211,11 +247,18 @@ public:
     // so that it ends up between the wait and the branch.
     DenseSet<const MachineInstr *> RecomputeVCCZBefore;
 
+    // Every S_ENDPGM / S_ENDPGM_SAVED of the block, with whether sending the
+    // dealloc VGPRs message is safe at that point: stores are in flight (so
+    // there is something to overlap with) and none is a scratch store (the
+    // message releases the VGPRs the scratch store still reads).
+    DenseMap<const MachineInstr *, bool> EndPgmSafeToMessage;
+
     bool operator==(const BasicBlockSolution &Other) const {
       return Before == Other.Before && AtEnd == Other.AtEnd &&
              NopAfterWait == Other.NopAfterWait &&
              NopAfterAtEnd == Other.NopAfterAtEnd &&
-             RecomputeVCCZBefore == Other.RecomputeVCCZBefore;
+             RecomputeVCCZBefore == Other.RecomputeVCCZBefore &&
+             EndPgmSafeToMessage == Other.EndPgmSafeToMessage;
     }
   };
 
