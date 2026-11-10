@@ -102,7 +102,8 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
       continue;
 
     FoundMatch = true;
-    ++CD.Count;
+    if (!isCapped(CD))
+      ++CD.Count;
 
     // NB: There is an intentional tradeoff here. We could avoid this loop by
     // instead storing a timestamp in each record, and having a monotonically
@@ -225,7 +226,7 @@ void EventTracker::verify() const {
     //    new one.
     DenseSet<std::pair<hash_code, unsigned>> RecIdentityCheck;
     for (const EventTrackerRecord &E : C.Timeline) {
-      if (E.getAge() > C.Count) {
+      if (E.getAge() > C.Count && !isCapped(C)) {
         OnError();
         dbgs() << "Concerning Record:";
         E.print(dbgs());
@@ -279,6 +280,13 @@ LLVM_DUMP_METHOD void EventTracker::dump() const {
   dbgs() << '\n';
 }
 #endif
+
+bool EventTracker::isCapped(const CounterData &CD) const {
+  if (!CD.IC || !CD.IC->hasLimit())
+    return false;
+  assert(CD.Count < CD.IC->getLimit() && "Counter already overflowed!");
+  return (CD.Count + 1) >= CD.IC->getLimit();
+}
 
 bool EventTracker::compareRecords(const EventTrackerRecord &A,
                                   const EventTrackerRecord &B) {

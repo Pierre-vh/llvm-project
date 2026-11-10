@@ -26,9 +26,13 @@ public:
 
     TrackerGetter = [&](const MachineBasicBlock &MBB) -> EventTracker & {
       const GCNSubtarget &ST = MBB.getParent()->getSubtarget<GCNSubtarget>();
+      // EventTracker stores pointers into the counter list, so it must outlive
+      // the trackers.
+      if (Counters.empty())
+        Counters = getCounters(ST, /*IsExpertMode=*/false);
       auto &Entry = Trackers[&MBB];
       if (!Entry)
-        Entry = std::make_unique<EventTracker>(MBB, getCounters(ST, /*IsExpertMode=*/false));
+        Entry = std::make_unique<EventTracker>(MBB, Counters);
       return *Entry;
     };
   }
@@ -52,6 +56,7 @@ public:
     return ET;
   }
 
+  SmallVector<AMDGPUInstCounter, NUM_INST_CNTS> Counters;
   std::function<EventTracker &(const MachineBasicBlock &)> TrackerGetter;
   DenseMap<const MachineBasicBlock *, std::unique_ptr<EventTracker>> Trackers;
 };
@@ -663,6 +668,84 @@ body:             |
   EXPECT_EQ(StoreCnt.cur().getMI()->getParent(), &BB2);
   EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
   EXPECT_FALSE(StoreCnt.next());
+}
+
+/// Check that the count of a counter stops at its limit minus 1, while the
+/// timeline keeps growing and record ages keep increasing.
+TEST_F(AMDGPUGFX12EventTrackingTest, CountCappedAtLimit) {
+  StringRef MIR = R"(
+name:            CountCappedAtLimit
+body:             |
+  bb.0:
+    liveins: $vgpr4_vgpr5
+
+    $vgpr4 = GLOBAL_LOAD_DWORD $vgpr4_vgpr5, 0, 0, implicit $exec
+    S_ENDPGM 0
+...
+)";
+  ASSERT_TRUE(parseMIR(MIR));
+  MachineFunction &MF = getMF("CountCappedAtLimit");
+  MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
+  MachineInstr &Load = BB0.front();
+  ASSERT_EQ(Load.getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
+
+  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
+  auto Counters = getCounters(ST, /*IsExpertMode=*/false);
+  const AMDGPUInstCounter *LoadIC = nullptr;
+  for (const AMDGPUInstCounter &IC : Counters) {
+    if (IC.getType() == AMDGPU::LOAD_CNT)
+      LoadIC = &IC;
+  }
+  ASSERT_TRUE(LoadIC && LoadIC->hasLimit());
+  const unsigned Limit = LoadIC->getLimit();
+  ASSERT_GT(Limit, 1u);
+
+  EventTracker ET(BB0, Counters);
+  ET.enterBlock(TrackerGetter);
+  const SingleHWEvent Ev = SingleHWEvent::encode(HWEvents::VMEM_READ_ACCESS);
+
+  // Fill the counter up to just before the cap.
+  for (unsigned I = 0; I < Limit - 2; ++I)
+    ET.record(Load, Ev);
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Limit - 2);
+  EXPECT_FALSE(ET.isCapped(AMDGPU::LOAD_CNT));
+
+  // One more event reaches the cap.
+  ET.record(Load, Ev);
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Limit - 1);
+  EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
+
+  // Further events no longer increment the count, but are still recorded and
+  // still age the existing records.
+  constexpr unsigned Extra = 5;
+  for (unsigned I = 0; I < Extra; ++I)
+    ET.record(Load, Ev);
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Limit - 1);
+  EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
+
+  const unsigned NumRecords = Limit - 1 + Extra;
+  ArrayRef<EventTrackerRecord> TL = ET.getTimeline(AMDGPU::LOAD_CNT);
+  ASSERT_EQ(TL.size(), NumRecords);
+  EXPECT_EQ(TL.front().getAge(), NumRecords - 1);
+  EXPECT_EQ(TL.back().getAge(), 0u);
+  EXPECT_GT(TL.front().getAge(), ET.count(AMDGPU::LOAD_CNT));
+
+  // Other counters are unaffected.
+  EXPECT_TRUE(TrackerRecordsChecker(ET, AMDGPU::STORE_CNT).unused());
+  EXPECT_FALSE(ET.isCapped(AMDGPU::STORE_CNT));
+
+  // A partial drain uncaps the counter and removes all records at or above the
+  // drained age.
+  ET.drain(AMDGPU::LOAD_CNT, 3);
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), 3u);
+  EXPECT_FALSE(ET.isCapped(AMDGPU::LOAD_CNT));
+  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), 3u);
+
+  // The counter can be capped again afterwards.
+  for (unsigned I = 0; I < Limit; ++I)
+    ET.record(Load, Ev);
+  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Limit - 1);
+  EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
 }
 
 } // namespace

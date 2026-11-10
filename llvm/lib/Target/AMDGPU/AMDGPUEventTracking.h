@@ -199,6 +199,11 @@ public:
   /// FIXME: Should be cached
   HWEvents getPendingEvents(InstCounterType T) const;
 
+  /// \returns true if the \ref count of \p T is at its max (Limit of the
+  /// counter minus 1), and new events do not increment the counter value
+  /// anymore.
+  bool isCapped(InstCounterType T) const { return isCapped(Counters[T]); }
+
   /// \returns the current timeline for \p T, which contains all known in-flight
   /// (not drained) records. The timeline is always sorted by descending
   /// age.
@@ -253,6 +258,8 @@ private:
     // one pred, but a waitcnt 8 for another. Not sure if we can exploit that
     // though?
   };
+
+  bool isCapped(const CounterData &CD) const;
 
   /// Orders records by descending age. Ties are broken by kind, then by
   /// parent MBB number, so that the order is deterministic.
