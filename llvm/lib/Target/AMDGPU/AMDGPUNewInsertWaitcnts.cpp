@@ -829,9 +829,7 @@ bool AMDGPUNewInsertWaitcnts::isOutOfOrder(const State &S,
 Waitcnt AMDGPUNewInsertWaitcnts::removeNoOpWaits(const State &S,
                                                  Waitcnt W) const {
   // At most count(T) events are in flight on every path, so a wait for
-  // N >= count(T) can never block. Must use count() (max over paths), not ages
-  // (min over paths), see roadmap A.8. Same test as the old simplifyWaitcnt
-  // (SIW:1292-1299).
+  // N >= count(T) can never block.
   //
   // TODO(gfx12+): XCNT and VM_VSRC have extra rules (simplifyXcnt,
   // simplifyVmVsrc). The plain count test is still sound for them.
@@ -841,6 +839,7 @@ Waitcnt AMDGPUNewInsertWaitcnts::removeNoOpWaits(const State &S,
     if (Val != ~0u && Val >= S.ET.count(T))
       W.set(T, ~0u);
   }
+
   return W;
 }
 
@@ -910,12 +909,6 @@ void AMDGPUNewInsertWaitcnts::recordEvents(State &S, MachineInstr &MI) {
       S.ET.drainCappedRecords(IC.getType());
     }
   }
-
-  // if (anyEventOn(MI,
-  //                EXP_CNT)) { // EXP clamp: at most Limit in flight
-  //                (SIW:712-716)
-  //   applyWait(S, waitOn(EXP_CNT, Limit(EXP_CNT)));
-  // }
 
   // The waitexp operand of VINTERP is an implicit EXP_CNT wait (SIW:2744-2746).
   // WaitcntRewriter may lower it to fold the wait decided before MI, which
@@ -1085,6 +1078,11 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
     Preceding = {};
     PWA = {removeNoOpWaits(S, getWaitsForcedAfter(MI)),
            TII.isAlwaysGDS(MI.getOpcode())};
+
+    // TODO: May want to verify less often once the pass is stable?
+#if !defined(NDEBUG) || defined(EXPENSIVE_CHECKS)
+    S.ET.verify();
+#endif
   }
 
   if (MBB.getFirstTerminator() == MBB.end()) { // fallthrough block

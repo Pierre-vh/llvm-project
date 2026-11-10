@@ -49,6 +49,9 @@ public:
           getEventsFor(MI, ST, /*IsExpertMode=*/false, /*TgSplit=*/false);
       for (HWEvents SingleEv : Events) {
         ET.record(MI, SingleHWEvent::encode(SingleEv));
+#if !defined(NDEBUG) || defined(EXPENSIVE_CHECKS)
+        ET.verify();
+#endif
       }
     }
     if (AfterVisit)

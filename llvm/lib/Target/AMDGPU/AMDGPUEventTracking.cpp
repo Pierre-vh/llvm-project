@@ -126,6 +126,7 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
     // carried over from a backedge and the other is from a more recent
     // iteration.
     CD.Timeline.push_back(Rec);
+    CD.PendingEventsCache |= Rec.getKind();
 
     LLVM_DEBUG(if (EventTrackerPrintAll) {
       dbgs().indent(2) << "Updated Timeline:\n";
@@ -177,6 +178,8 @@ void EventTracker::drain(InstCounterType T, unsigned N) {
     });
   }
 
+  CD.PendingEventsCache = calcPendingEvents(CD);
+
 #ifdef EXPENSIVE_CHECKS
   verify();
 #endif
@@ -200,10 +203,7 @@ unsigned EventTracker::count(InstCounterType T) const {
 }
 
 HWEvents EventTracker::getPendingEvents(InstCounterType T) const {
-  HWEvents Res;
-  for (const auto &E : Counters[T].Timeline)
-    Res |= E.getKind();
-  return Res;
+  return Counters[T].PendingEventsCache;
 }
 
 void EventTracker::drainCappedRecords(InstCounterType T) {
@@ -222,8 +222,10 @@ void EventTracker::drainCappedRecords(InstCounterType T) {
       break;
   }
 
-  if (NumAboveCap > 0)
+  if (NumAboveCap > 0) {
     CD.Timeline.erase(CD.Timeline.begin(), CD.Timeline.begin() + NumAboveCap);
+    CD.PendingEventsCache = calcPendingEvents(CD);
+  }
 }
 
 ArrayRef<EventTrackerRecord>
@@ -278,6 +280,14 @@ void EventTracker::verify() const {
       OnError();
       llvm_unreachable("live records are not sorted!");
     }
+
+    HWEvents PendingEvents = calcPendingEvents(C);
+    if (PendingEvents != C.PendingEventsCache) {
+      OnError();
+      dbgs() << "Current Pending Events: " << PendingEvents << "\n";
+      dbgs() << "Cached Pending Events: " << C.PendingEventsCache << "\n";
+      llvm_unreachable("pending events cache is incorrect!");
+    }
   }
 }
 #endif
@@ -309,6 +319,13 @@ LLVM_DUMP_METHOD void EventTracker::dump() const {
   dbgs() << '\n';
 }
 #endif
+
+HWEvents EventTracker::calcPendingEvents(const CounterData &CD) {
+  HWEvents Res;
+  for (const EventTrackerRecord &R : CD.Timeline)
+    Res |= R.getKind();
+  return Res;
+}
 
 bool EventTracker::isCapped(const CounterData &CD) const {
   if (!CD.IC || !CD.IC->hasLimit())
@@ -390,6 +407,7 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
 
     auto AccVals = Acc.values();
     CData.Timeline.append(AccVals.begin(), AccVals.end());
+    CData.PendingEventsCache = calcPendingEvents(CData);
 
     // Sort records by descending age for consistent iteration.
     stable_sort(CData.Timeline, compareRecords);

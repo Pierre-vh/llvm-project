@@ -202,7 +202,6 @@ public:
   unsigned count(InstCounterType T) const;
 
   /// \returns the set of pending HWEvents for \p T.
-  /// FIXME: Should be cached
   HWEvents getPendingEvents(InstCounterType T) const;
 
   /// \returns true if the \ref count of \p T is at its max (Limit of the
@@ -210,7 +209,7 @@ public:
   /// anymore.
   bool isCapped(InstCounterType T) const { return isCapped(Counters[T]); }
 
-  /// Drain all records of \p T that have an age >= the cap of its counter.
+  /// Drain all records of \p T that have an age >= the cap of \p T.
   void drainCappedRecords(InstCounterType T);
 
   /// \returns the current timeline for \p T, which contains all known in-flight
@@ -260,6 +259,10 @@ private:
     /// removed entirely, or be marked as debug.
     uint32_t Count = 0;
 
+    /// Cached pending events. Updated when recording new events, recomputed
+    /// whenever events are removed.
+    HWEvents PendingEventsCache;
+
     // TODO: We could imagine storing the per-predecessor age for incoming
     // events. We could achieve that by storing that as a map of ((ID, Pred),
     // Age). This would allow identifying events that are "deep" in one
@@ -267,6 +270,8 @@ private:
     // one pred, but a waitcnt 8 for another. Not sure if we can exploit that
     // though?
   };
+
+  static HWEvents calcPendingEvents(const CounterData &CD);
 
   bool isCapped(const CounterData &CD) const;
 
