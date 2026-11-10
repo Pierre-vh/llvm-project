@@ -1,6 +1,6 @@
-; RUN: llc -mtriple=amdgpu7.00--amdhsa < %s | FileCheck -enable-var-scope -check-prefix=GCN %s
-; RUN: llc -mtriple=amdgpu8.03--amdhsa -mattr=-flat-for-global < %s | FileCheck -enable-var-scope -check-prefix=GCN %s
-; RUN: llc -mtriple=amdgpu9.00--amdhsa < %s | FileCheck -enable-var-scope -check-prefixes=GCN,GFX9 %s
+; RUN: llc -enable-new-insertwaitcnts -mtriple=amdgpu7.00--amdhsa < %s | FileCheck -enable-var-scope -check-prefix=GCN %s
+; RUN: llc -enable-new-insertwaitcnts -mtriple=amdgpu8.03--amdhsa -mattr=-flat-for-global < %s | FileCheck -enable-var-scope -check-prefix=GCN %s
+; RUN: llc -enable-new-insertwaitcnts -mtriple=amdgpu9.00--amdhsa < %s | FileCheck -enable-var-scope -check-prefixes=GCN,GFX9 %s
 
 ; If flat_store_dword and flat_load_dword use different registers for the data
 ; operand, this test is not broken.  It just means it is no longer testing

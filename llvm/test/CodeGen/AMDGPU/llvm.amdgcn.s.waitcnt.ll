@@ -1,7 +1,7 @@
-; RUN: llc -global-isel=0 -mtriple=amdgpu6.00 < %s | FileCheck %s
-; RUN: llc -global-isel=1 -mtriple=amdgpu6.00 < %s | FileCheck %s
-; RUN: llc -global-isel=0 -mtriple=amdgpu8.02 < %s | FileCheck %s
-; RUN: llc -global-isel=1 -mtriple=amdgpu8.02 < %s | FileCheck %s
+; RUN: llc -enable-new-insertwaitcnts -global-isel=0 -mtriple=amdgpu6.00 < %s | FileCheck %s
+; RUN: llc -enable-new-insertwaitcnts -global-isel=1 -mtriple=amdgpu6.00 < %s | FileCheck %s
+; RUN: llc -enable-new-insertwaitcnts -global-isel=0 -mtriple=amdgpu8.02 < %s | FileCheck %s
+; RUN: llc -enable-new-insertwaitcnts -global-isel=1 -mtriple=amdgpu8.02 < %s | FileCheck %s
 
 ; CHECK-LABEL: {{^}}test1:
 ; CHECK-NOT: s_waitcnt

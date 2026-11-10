@@ -1,4 +1,4 @@
-; RUN: llc -O3 -mtriple=amdgpu10.10 < %s | FileCheck --check-prefix=CHECK %s
+; RUN: llc -enable-new-insertwaitcnts -O3 -mtriple=amdgpu10.10 < %s | FileCheck --check-prefix=CHECK %s
 
 ; SIInsertWaitcnts should preserve waitcnt instructions coming from the user.
 ; s_waitcnt_vscnt only exists on gfx10+.

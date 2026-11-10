@@ -1,4 +1,4 @@
-; RUN: llc < %s -mtriple=amdgpu8.03--amdhsa -mattr=-flat-for-global -amdgpu-load-store-vectorizer=0 | FileCheck --check-prefix=GCN %s
+; RUN: llc -enable-new-insertwaitcnts < %s -mtriple=amdgpu8.03--amdhsa -mattr=-flat-for-global -amdgpu-load-store-vectorizer=0 | FileCheck --check-prefix=GCN %s
 
 ; Check that the waitcnt insertion algorithm correctly propagates wait counts
 ; from before a loop to the loop header.
