@@ -34,6 +34,10 @@ class SIRegisterInfo;
 
 namespace AMDGPU {
 
+//===----------------------------------------------------------------------===//
+// Instruction Helpers
+//===----------------------------------------------------------------------===//
+
 bool isWaitInstr(MachineInstr &MI);
 
 // ASYNCMARK and WAIT_ASYNCMARK are meta instructions that emit no hardware
@@ -64,6 +68,10 @@ getPrecedingWaitsBegin(MachineBasicBlock &MBB,
 bool isNextNonMetaEndpgm(MachineBasicBlock &MBB,
                          MachineBasicBlock::instr_iterator It);
 
+/// \returns true if \p MI defines any registers covered by \p RUs.
+bool definesAnyRUs(const SIRegisterInfo &TRI, const MachineInstr &MI,
+                   const DenseSet<MCRegUnit> &RUs);
+
 //===----------------------------------------------------------------------===//
 // Register and memory dependency helpers
 //===----------------------------------------------------------------------===//
@@ -74,9 +82,7 @@ bool isNextNonMetaEndpgm(MachineBasicBlock &MBB,
 bool trackedRegsOverlap(const SIRegisterInfo &TRI, MCRegister A, MCRegister B);
 
 /// \returns true if \p MI is a memory access that only increments the vector
-/// memory counter (LOAD_CNT and its split variants SAMPLE_CNT/BVH_CNT, or
-/// STORE_CNT): non-FLAT VMEM instructions, and FLAT global/scratch
-/// instructions. Generic FLAT instructions may also access LDS and are
+/// memory counter. Generic FLAT instructions may also access LDS and are
 /// excluded.
 bool updatesVMCntOnly(const MachineInstr &MI);
 
@@ -86,9 +92,7 @@ bool updatesVMCntOnly(const MachineInstr &MI);
 bool mayUsePointSampleAccel(const GCNSubtarget &ST, const MachineInstr &MI);
 
 /// \returns the events that a VGPR written by the VMEM instruction \p MI is
-/// pending on, for the purpose of in-order write checks. This is the
-/// simplified VMEM event of \p MI, plus VMEM_READ_ACCESS if point sample
-/// acceleration may turn \p MI into a plain read.
+/// pending on.
 HWEvents getVGPRWriteEvents(const GCNSubtarget &ST, const SIInstrInfo &TII,
                             const MachineInstr &MI);
 
@@ -112,8 +116,8 @@ void getEXPCntLockedOperands(const SIInstrInfo &TII, const SIRegisterInfo &TRI,
 ///  - EXP_CNT: see \ref getEXPCntLockedOperands.
 ///  - LOAD_CNT, SAMPLE_CNT, BVH_CNT: the explicit vector register defs.
 ///  - Other counters: all explicit defs.
-/// Implicit operands are excluded: on memory instructions they only model
-/// super-register liveness.
+/// Implicit operands are excluded because on memory instructions they only
+/// model super-register liveness.
 void getOperandsTrackedByCounter(const SIInstrInfo &TII,
                                  const SIRegisterInfo &TRI,
                                  const MachineRegisterInfo &MRI,
@@ -185,14 +189,11 @@ public:
   /// Forget all about \p MBB: erase all entries that mention MBB.
   void forget(const MachineBasicBlock &MBB) { Solutions.erase(&MBB); }
 
-  // isIdenticalTo -> just use ==
-
 private:
   DenseMap<const MachineBasicBlock *, BasicBlockSolution> Solutions;
 };
 
 /// Utility to visit a MachineFunction in reverse post order, with some extras.
-/// This is an info class, its
 class WaitcntRPOInfo {
 public:
   WaitcntRPOInfo(MachineFunction &MF);

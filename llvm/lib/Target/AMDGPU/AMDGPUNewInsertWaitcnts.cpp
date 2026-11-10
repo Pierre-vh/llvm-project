@@ -67,8 +67,11 @@ struct State {
 
   EventTracker ET;
 
-  // TODO: ASYNCMARK state goes here (App. B). It must take part in operator==
+  // TODO: ASYNCMARK state goes here. It must take part in operator==
   // and the join.
+  //  - Join is currently handled by the EventTracker. Does it mean this State
+  //    will need to handle join in the future ? Can we find another way?
+  //    Can EventTracker do it?
 
   bool operator==(const State &Other) const { return ET == Other.ET; }
 };
@@ -77,7 +80,7 @@ class AMDGPUNewInsertWaitcnts {
 public:
   AMDGPUNewInsertWaitcnts(MachineFunction &MF, MachineLoopInfo &MLI,
                           MachinePostDominatorTree &PDT, AAResults *AA)
-      : MF(MF), MLI(MLI), PDT(PDT), AA(AA), ST(MF.getSubtarget<GCNSubtarget>()),
+      : MF(MF), AA(AA), ST(MF.getSubtarget<GCNSubtarget>()),
         MFI(*MF.getInfo<AMDGPUMachineFunctionInfo>()), TII(*ST.getInstrInfo()),
         TRI(*ST.getRegisterInfo()), MRI(MF.getRegInfo()),
         InstCounters(MFI.getInstCounters()), IV(getIsaVersion(ST.getCPU())),
@@ -101,8 +104,10 @@ public:
   /// Runs the pass on the function. \returns true if the MIR changed.
   bool run();
 
+private:
   /// Computes the waits of every block into \p Sol without modifying the MIR.
   void solve(Solution &Sol);
+
   /// Emits the waits in \p Sol into the MIR, rewriting the preceding waits of
   /// each decision point.
   /// \returns true if the MIR changed.
@@ -111,8 +116,7 @@ public:
   /// Checks that the emitted MIR satisfies every dependency (debug aid).
   void verify();
 
-private:
-  /// Walks \p MBB from its in-state (rebuilt from the predecessors' entries in
+  /// Walks \p MBB from its in-state (rebuilt from the predecessors'
   /// \p OutStates) and leaves its out-state in \p OutStates. Blocks in
   /// \p ForceDrain are fully drained before their terminator. Decisions are
   /// recorded in \p Sol if non-null.
@@ -121,76 +125,94 @@ private:
                  const DenseSet<const MachineBasicBlock *> &ForceDrain,
                  Solution *Sol);
 
-  /// \returns true if vmcnt must be drained at the end of the loop preheader
-  /// \p MBB, given its state \p S before the terminator.
+  /// \param S the state of \p MBB before its terminator
+  /// \param MBB a basic block which may be a loop preheader.
+  /// \returns true if \p MBB is a loop preheader, and we must wait for all
+  /// loads (LOADCNT/vmcnt) at the end of \p MBB.
   bool shouldFlushPreheader(const State &S, const MachineBasicBlock &MBB);
 
-  /// \returns true if a def of \p MI has a register unit in \p RUs.
-  bool definesAnyRUs(const MachineInstr &MI, const DenseSet<MCRegUnit> &RUs);
-  /// \returns the waits needed at the end of \p MBB: a full drain if it is in
-  /// \p ForceDrain, and the preheader flush.
+  /// \returns the waits needed at the end of \p MBB, taking into account
+  /// pre-header flushing (see \ref shouldFlushPreheader) if necessary. If \p
+  /// MBB is in \p ForceDrain, all InstCounters will be drained.
   Waitcnt getWaitsAtEnd(const State &S, const MachineBasicBlock &MBB,
                         const DenseSet<const MachineBasicBlock *> &ForceDrain);
 
-  /// \returns everything to wait for before \p MI (at the end of the block if
-  /// \p MI is null): the preceding waits \p Preceding (soft ones simplified),
-  /// \p ExtraWait, and the waits \p MI requires.
+  /// Computes waits necessary before a certain point in a MBB.
+  /// \param S the current State of a MBB.
+  /// \param MI a MachineInstr, or nullptr to indicate the end of the MBB.
+  /// \param Preceding Waits that precede \p MI
+  /// \param ExtraWait Extra wait to take into account.
+  /// \returns everything to wait for before \p MI; this also includes
+  /// \ref getWaitsRequiredBy
   Waitcnt getWaitsBefore(const State &S, const MachineInstr *MI,
                          const PrecedingWaits &Preceding, Waitcnt ExtraWait);
-  /// \returns the waits \p MI requires in state \p S: its dependencies on
-  /// pending records, and the counters that must be empty before it.
+
+  /// \param S the current State of a MBB.
+  /// \param MI a MachineInstr
+  /// \returns the waits necessary to satisfy any dependency of \p MI on
+  /// in-flight events.
   Waitcnt getWaitsRequiredBy(const State &S, const MachineInstr &MI);
+
+  /// \returns a wait of 0 on every counter that must be empty before \p MI
+  /// These are state-independent waits which are required by the ISA.
+  Waitcnt getAlwaysRequiredWaitsBefore(const MachineInstr &MI) const;
+
   /// \returns true if \p MI must wait for record \p R of counter \p T, through
   /// a register (RAW, WAW, WAR) or a memory dependency.
   bool hasDependencyOn(const State &S, const MachineInstr &MI,
                        const EventTrackerRecord &R, InstCounterType T) const;
-  /// \returns true if an operand of \p MI checked on \p T overlaps a register
-  /// that producer \p P keeps busy on \p T (see getOperandsTrackedByCounter).
+
+  /// \returns true if a register operand of \p MI has a dependency on an
+  /// operand of \p P via the counter \p T.
+  /// (see \ref getOperandsTrackedByCounter).
   bool hasRegDependencyOn(const State &S, const MachineInstr &MI,
                           const MachineInstr &P, InstCounterType T) const;
-  /// \returns true if \p MI must wait for producer \p P on \p T through memory:
-  /// an LDS access after an aliasing LDS DMA (LOAD_CNT), or a store to an
-  /// address loaded by SMEM (SMEM counter).
+
+  /// \returns true if \p MI has a memory dependency on \p P via the counter \p
+  /// T. (e.g. LDS access after aliasing DMAs)
   bool hasMemDependencyOn(const MachineInstr &MI, const MachineInstr &P,
                           InstCounterType T) const;
+
   /// \returns true if operand \p Op of \p MI can depend on a pending event of
   /// counter \p T, based on its register class, use/def role and, for WAW and
   /// EXP_CNT uses, the pending events in \p S.
   bool isOperandCheckedOn(const State &S, const MachineInstr &MI,
                           const MachineOperand &Op, InstCounterType T) const;
+
   /// \returns true if the VMEM instruction \p MI writing VGPR \p Reg needs no
   /// WAW wait: the target writes VGPRs in order and every pending write to
   /// \p Reg has the same VMEM event kind as \p MI.
   bool isInOrderVGPRWrite(const State &S, const MachineInstr &MI,
                           MCRegister Reg) const;
+
   /// \returns the VGPR write events (see getVGPRWriteEvents) of the pending
   /// VM_CNT-only producers that write \p Reg.
   HWEvents getPendingVGPRWriteEvents(const State &S, MCRegister Reg) const;
+
   /// \returns the register to check on \p T for operand register \p Reg of
   /// \p MI: the enclosing 32-bit VGPR if a 16-bit write may clobber the other
   /// half (D16Writes32BitVgpr), else \p Reg.
   MCRegister getRegToCheck(const State &S, const MachineInstr &MI,
                            MCRegister Reg, InstCounterType T) const;
-  /// \returns true if a pending record of \p T keeps a register overlapping
-  /// \p Reg busy.
+
+  /// \returns true if there is a pending write to \p Ref tracked via \p T.
   bool hasPendingWriteTo(const State &S, MCRegister Reg,
                          InstCounterType T) const;
 
   /// \returns true if events pending on \p T may complete out of order, in
   /// which case only a wait for 0 guarantees anything.
   bool isOutOfOrder(const State &S, InstCounterType T) const;
-  /// \returns \p W without the waits that can never block in \p S, i.e. those
-  /// not smaller than the maximum number of events in flight on the counter.
+
+  /// \returns \p W without the waits that can never block given \p S.
   Waitcnt removeNoOpWaits(const State &S, Waitcnt W) const;
-  /// Simplifies the soft (memory legalizer) wait \p W in \p S. No-op at -O0.
-  Waitcnt simplify(const State &S, Waitcnt W) const;
+
+  /// Simplifies the soft wait \p W in \p S. No-op at -O0.
+  Waitcnt simplifySoftWait(const State &S, Waitcnt W) const;
+
   /// \returns \p W without its LOAD_CNT wait if only cache invalidates are
   /// pending on LOAD_CNT.
   Waitcnt removeVmemInvOnlyWait(const State &S, Waitcnt W) const;
 
-  /// \returns a wait of 0 on every counter that must be empty before \p MI
-  /// (returns, cache invalidates, GS_DONE, barriers), state-independent.
-  Waitcnt mustBeEmptyBefore(const MachineInstr &MI) const;
   /// \returns true if \p P writes the callee address of \p Call or, for a
   /// register callee, its saved return address.
   bool writesCallAddrOrDst(const MachineInstr &P,
@@ -199,11 +221,13 @@ private:
   /// Applies the wait \p W to \p S. Non-zero waits on out-of-order counters
   /// are ignored. The only caller of EventTracker::drain.
   void applyWait(State &S, const Waitcnt &W);
-  /// Records the events of \p MI in \p S. Calls drain all but STORE_CNT.
+
+  /// Records the events of \p MI into \p S.
   void recordEvents(State &S, MachineInstr &MI);
 
   /// Models unknown stores left in flight by a caller or callee (T6).
   void setStateOnFunctionEntryOrReturn(State &S);
+
   /// \returns the waits forced right after \p MI (precise memory mode).
   Waitcnt getWaitsForcedAfter(const MachineInstr &MI) const;
 
@@ -242,8 +266,6 @@ private:
   bool flatForcesZero(const State &S, InstCounterType T) const;
 
   MachineFunction &MF;
-  MachineLoopInfo &MLI;
-  MachinePostDominatorTree &PDT;
   AAResults *AA = nullptr;
   const GCNSubtarget &ST;
   const AMDGPUMachineFunctionInfo &MFI;
@@ -372,7 +394,7 @@ struct PendingWaitAfter {
 
 bool AMDGPUNewInsertWaitcnts::shouldFlushPreheader(
     const State &S, const MachineBasicBlock &MBB) {
-  // FIXME: Entire function here is AI written; very logic.
+  // FIXME: Entire function here is AI written; verify logic.
   const WaitcntLoopPreheaderInfo::Entry *L = LoopPreInfo.getPreheaderInfo(MBB);
   if (!L)
     return false;
@@ -391,19 +413,8 @@ bool AMDGPUNewInsertWaitcnts::shouldFlushPreheader(
   // State-dependent half (SIW:3368-3372): a load still in flight writes a
   // vector unit the loop reads (R8).
   return any_of(S.ET.getTimeline(LOAD_CNT), [&](const EventTrackerRecord &R) {
-    return definesAnyRUs(*R.getMI(), L->UsedVectorUnits);
+    return definesAnyRUs(TRI, *R.getMI(), L->UsedVectorUnits);
   });
-}
-
-bool AMDGPUNewInsertWaitcnts::definesAnyRUs(const MachineInstr &MI,
-                                            const DenseSet<MCRegUnit> &RUs) {
-  for (const MachineOperand &Def : MI.defs()) {
-    for (MCRegUnit RU : TRI.regunits(Def.getReg())) {
-      if (RUs.contains(RU))
-        return true;
-    }
-  }
-  return false;
 }
 
 Waitcnt AMDGPUNewInsertWaitcnts::getWaitsAtEnd(
@@ -428,7 +439,7 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsBefore(const State &S,
   Waitcnt W = Preceding.CombinedWaits;
 
   for (const Waitcnt &Soft : Preceding.SoftWaits) {
-    W = W.combined(simplify(S, Soft));
+    W = W.combined(simplifySoftWait(S, Soft));
   }
 
   if (Preceding.SeenLDSDirectWait) {
@@ -472,7 +483,7 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsRequiredBy(const State &S,
   // Counters that must be empty before MI. The old pass simplifies these like
   // any other wait (SIW:2567), and also drops a return's INV-only LOAD wait
   // (SIW:2340), even at -O0.
-  Waitcnt Empty = removeNoOpWaits(S, mustBeEmptyBefore(MI));
+  Waitcnt Empty = removeNoOpWaits(S, getAlwaysRequiredWaitsBefore(MI));
   if (MI.isReturn() && !MI.isCall())
     Empty = removeVmemInvOnlyWait(S, Empty);
   W = W.combined(Empty);
@@ -511,8 +522,8 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsRequiredBy(const State &S,
   return W;
 }
 
-Waitcnt
-AMDGPUNewInsertWaitcnts::mustBeEmptyBefore(const MachineInstr &MI) const {
+Waitcnt AMDGPUNewInsertWaitcnts::getAlwaysRequiredWaitsBefore(
+    const MachineInstr &MI) const {
   // Port of the forced waits in generateWaitcntInstBefore (SIW:2318-2366,
   // 2553-2556). Returns a 0 for every counter that must be drained before MI.
   Waitcnt W;
@@ -816,7 +827,8 @@ Waitcnt AMDGPUNewInsertWaitcnts::removeNoOpWaits(const State &S,
   return W;
 }
 
-Waitcnt AMDGPUNewInsertWaitcnts::simplify(const State &S, Waitcnt W) const {
+Waitcnt AMDGPUNewInsertWaitcnts::simplifySoftWait(const State &S,
+                                                  Waitcnt W) const {
   // Soft waits are kept as-is at -O0 (SIW:1677).
   if (OptNone)
     return W;
@@ -852,12 +864,10 @@ void AMDGPUNewInsertWaitcnts::applyWait(State &S, const Waitcnt &W) {
   for (const AMDGPUInstCounter &IC : InstCounters) {
     InstCounterType T = IC.getType();
     unsigned Val = W.get(T);
-    if (Val == ~0u) {
+    if (Val == ~0u)
       continue;
-    }
-    if (Val != 0 && isOutOfOrder(S, T)) { // guarantees nothing (SIW:1537)
+    if (Val != 0 && isOutOfOrder(S, T))
       continue;
-    }
     S.ET.drain(T, Val);
   }
 
@@ -1006,7 +1016,6 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
 
   // TODO: VCCZ schtuff
 
-  // TODO: carry stuff
   PrecedingWaits Preceding;
   PendingWaitAfter PWA;
 

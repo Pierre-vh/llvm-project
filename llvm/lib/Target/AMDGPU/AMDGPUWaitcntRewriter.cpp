@@ -6,11 +6,6 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Port of the MIR-rewriting half of SIInsertWaitcnts
-// (applyPreexistingWaitcnt, createNewWaitcnt and the VINTERP part of
-// generateWaitcnt), without the state-dependent simplification, which the
-// solver has already done.
-//
 //===----------------------------------------------------------------------===//
 
 #include "AMDGPUWaitcntRewriter.h"
@@ -46,8 +41,7 @@ static bool promoteSoftWait(const SIInstrInfo &TII, MachineInstr &MI) {
 
 /// Updates the reused wait \p MI to \p Imm and promotes it. \returns true if
 /// \p MI changed.
-static bool updateWait(const SIInstrInfo &TII, MachineInstr &MI,
-                       unsigned Imm) {
+static bool updateWait(const SIInstrInfo &TII, MachineInstr &MI, unsigned Imm) {
   bool Changed = setSImm16(MI, Imm);
   return promoteSoftWait(TII, MI) || Changed;
 }
@@ -98,11 +92,15 @@ bool WaitcntRewriter::rewrite(MachineBasicBlock &MBB,
                               MachineBasicBlock::instr_iterator It, Waitcnt W,
                               bool NopAfter) {
   W = restrictToCounters(W);
+
+  // TODO: Should this collect waits instead to be more robust ? Can we have
+  // cases with, e.g.
+  //  s_waitcnt
+  //  (some inst that isn't a wait but doesn't interact with them in any way)
+  //  s_waitcnt
+  // ?
   MachineBasicBlock::instr_iterator Begin = getPrecedingWaitsBegin(MBB, It);
 
-  // Bundles: like the old pass, the walk visits instructions inside bundles
-  // and waits are inserted with instr_iterators, right before the bundled
-  // instruction.
   bool Modified = ST.hasExtendedWaitCounts() ? reuseGFX12Plus(Begin, It, W)
                                              : reusePreGFX12(Begin, It, W);
   Modified |= foldIntoVINTERP(MBB, It, W);
@@ -113,13 +111,13 @@ bool WaitcntRewriter::rewrite(MachineBasicBlock &MBB,
     BuildMI(MBB, It, MBB.findDebugLoc(It), TII.get(AMDGPU::S_NOP)).addImm(0);
     Modified = true;
   }
+
   return Modified;
 }
 
 bool WaitcntRewriter::reusePreGFX12(MachineBasicBlock::instr_iterator Begin,
                                     MachineBasicBlock::instr_iterator It,
                                     Waitcnt &W) {
-  // SIW:1633-1772.
   bool Modified = false;
   MachineInstr *WaitcntMI = nullptr;
   MachineInstr *VsCntMI = nullptr;
@@ -129,12 +127,14 @@ bool WaitcntRewriter::reusePreGFX12(MachineBasicBlock::instr_iterator Begin,
       continue;
 
     switch (SIInstrInfo::getNonSoftWaitcntOpcode(II.getOpcode())) {
-    case AMDGPU::WAIT_ASYNCMARK:
-      break; // Shows up in the assembly as a comment: keep it.
+    case AMDGPU::WAIT_ASYNCMARK: // keep as comment in output
+      break;
     case AMDGPU::S_WAITCNT:
     case AMDGPU::S_WAITCNT_VSCNT: {
       bool IsVsCnt = SIInstrInfo::getNonSoftWaitcntOpcode(II.getOpcode()) ==
                      AMDGPU::S_WAITCNT_VSCNT;
+      // If we already encountered the same inst before, only keep the first one
+      // and erase the latest one.
       MachineInstr *&Kept = IsVsCnt ? VsCntMI : WaitcntMI;
       if (!Kept) {
         Kept = &II;
@@ -153,8 +153,7 @@ bool WaitcntRewriter::reusePreGFX12(MachineBasicBlock::instr_iterator Begin,
     }
   }
 
-  // A kept wait with nothing left to wait for is erased if soft. The old pass
-  // keeps hard ones (updated to "no wait").
+  // Soft waits with nothing to wait on are erased.
   const auto Finish = [&](MachineInstr *MI, bool HasWait, unsigned Imm) {
     if (!MI)
       return;
@@ -173,23 +172,26 @@ bool WaitcntRewriter::reusePreGFX12(MachineBasicBlock::instr_iterator Begin,
     W.clear(EXP_CNT);
     W.clear(DS_CNT);
   }
+
   if (VsCntMI) {
     Finish(VsCntMI, W.hasWaitStoreCnt(), W.get(STORE_CNT));
     W.clear(STORE_CNT);
   }
+
   return Modified;
 }
 
 bool WaitcntRewriter::reuseGFX12Plus(MachineBasicBlock::instr_iterator Begin,
                                      MachineBasicBlock::instr_iterator It,
                                      Waitcnt &W) {
-  // SIW:1884-2185, minus S_WAITCNT_DEPCTR, which is not part of the preceding waits
-  // here (TODO(gfx12+, expert mode)).
+  // TODO: S_WAITCNT_DEPCTR/expert mode support.
   bool Modified = false;
   MachineInstr *LoadDsMI = nullptr;
   MachineInstr *StoreDsMI = nullptr;
   MachineInstr *SingleMIs[NUM_INST_CNTS] = {};
 
+  // When collecting waits, we just keep the first one encountered for reuse.
+  // Any duplicates encountered are erased.
   const auto KeepFirst = [&](MachineInstr *&Kept, MachineInstr &II) {
     if (!Kept) {
       Kept = &II;
@@ -205,8 +207,8 @@ bool WaitcntRewriter::reuseGFX12Plus(MachineBasicBlock::instr_iterator Begin,
 
     unsigned Opcode = SIInstrInfo::getNonSoftWaitcntOpcode(II.getOpcode());
     switch (Opcode) {
-    case AMDGPU::S_WAITCNT:      // Legacy: left alone (SIW:1922).
-    case AMDGPU::WAIT_ASYNCMARK: // Kept as an assembly comment.
+    case AMDGPU::S_WAITCNT:      // legacy waits
+    case AMDGPU::WAIT_ASYNCMARK: // keep as comment in output
       break;
     case AMDGPU::S_WAITCNT_lds_direct:
       II.eraseFromParent();
@@ -235,10 +237,11 @@ bool WaitcntRewriter::reuseGFX12Plus(MachineBasicBlock::instr_iterator Begin,
     Modified = true;
   };
 
-  // A combined wait is only kept if both of its counters need a wait.
-  // Otherwise it is erased and single-counter waits are created instead.
-  const auto ReuseCombined = [&](MachineInstr *&MI, InstCounterType T,
-                                 unsigned Enc) {
+  // A combined wait LOAD/STORE + DSCNT wait is only kept if both of its
+  // counters need a wait. Otherwise it is erased and single-counter waits are
+  // created instead.
+  const auto ReuseCombinedDsWait = [&](MachineInstr *&MI, InstCounterType T,
+                                       unsigned Enc) {
     if (!MI)
       return;
     if (W.get(T) == ~0u || W.get(DS_CNT) == ~0u) {
@@ -249,8 +252,9 @@ bool WaitcntRewriter::reuseGFX12Plus(MachineBasicBlock::instr_iterator Begin,
     W.clear(T);
     W.clear(DS_CNT);
   };
-  ReuseCombined(LoadDsMI, LOAD_CNT, encodeLoadcntDscnt(IV, W));
-  ReuseCombined(StoreDsMI, STORE_CNT, encodeStorecntDscnt(IV, W));
+
+  ReuseCombinedDsWait(LoadDsMI, LOAD_CNT, encodeLoadcntDscnt(IV, W));
+  ReuseCombinedDsWait(StoreDsMI, STORE_CNT, encodeStorecntDscnt(IV, W));
 
   // If DS and exactly one of LOAD/STORE remain, erase their single waits so
   // that emitGFX12Plus creates a combined wait instead.
@@ -274,13 +278,13 @@ bool WaitcntRewriter::reuseGFX12Plus(MachineBasicBlock::instr_iterator Begin,
     Modified |= updateWait(TII, *SingleMIs[T], W.get(T));
     W.clear(T);
   }
+
   return Modified;
 }
 
 bool WaitcntRewriter::foldIntoVINTERP(MachineBasicBlock &MBB,
                                       MachineBasicBlock::instr_iterator It,
                                       Waitcnt &W) {
-  // SIW:2627-2640: the EXP_CNT wait goes into the VINTERP's waitexp operand.
   if (It == MBB.instr_end() || !SIInstrInfo::isVINTERP(*It) ||
       W.get(EXP_CNT) == ~0u)
     return false;
@@ -291,6 +295,7 @@ bool WaitcntRewriter::foldIntoVINTERP(MachineBasicBlock &MBB,
     WaitExp->setImm(W.get(EXP_CNT));
     Modified = true;
   }
+
   W.clear(EXP_CNT);
   return Modified;
 }
@@ -298,7 +303,7 @@ bool WaitcntRewriter::foldIntoVINTERP(MachineBasicBlock &MBB,
 bool WaitcntRewriter::emitPreGFX12(MachineBasicBlock &MBB,
                                    MachineBasicBlock::instr_iterator It,
                                    const Waitcnt &W) {
-  // SIW:1774-1882, without the profiling expansion.
+  // FIXME: Add profiling expansion here
   const DebugLoc &DL = MBB.findDebugLoc(It);
   bool Modified = false;
 
@@ -307,6 +312,7 @@ bool WaitcntRewriter::emitPreGFX12(MachineBasicBlock &MBB,
         .addImm(encodeWaitcnt(IV, W));
     Modified = true;
   }
+
   if (W.hasWaitStoreCnt()) {
     assert(ST.hasVscnt());
     BuildMI(MBB, It, DL, TII.get(AMDGPU::S_WAITCNT_VSCNT))
@@ -314,13 +320,14 @@ bool WaitcntRewriter::emitPreGFX12(MachineBasicBlock &MBB,
         .addImm(W.get(STORE_CNT));
     Modified = true;
   }
+
   return Modified;
 }
 
 bool WaitcntRewriter::emitGFX12Plus(MachineBasicBlock &MBB,
                                     MachineBasicBlock::instr_iterator It,
                                     Waitcnt W) {
-  // SIW:2187-2275, without the profiling expansion.
+  // FIXME: Add profiling expansion here
   const DebugLoc &DL = MBB.findDebugLoc(It);
   bool Modified = false;
 
@@ -355,6 +362,7 @@ bool WaitcntRewriter::emitGFX12Plus(MachineBasicBlock &MBB,
     BuildMI(MBB, It, DL, TII.get(AMDGPU::S_WAITCNT_DEPCTR)).addImm(Enc);
     Modified = true;
   }
+
   return Modified;
 }
 
@@ -371,9 +379,8 @@ Waitcnt WaitcntRewriter::decodePrecedingWaits(
     W = W.combined(decode(II, IV));
   }
 
-  if (It != MBB.instr_end() && SIInstrInfo::isVINTERP(*It)) {
-    W.add(EXP_CNT,
-          TII.getNamedOperand(*It, AMDGPU::OpName::waitexp)->getImm());
-  }
+  if (It != MBB.instr_end() && SIInstrInfo::isVINTERP(*It))
+    W.add(EXP_CNT, TII.getNamedOperand(*It, AMDGPU::OpName::waitexp)->getImm());
+
   return restrictToCounters(W);
 }

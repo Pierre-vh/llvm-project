@@ -24,14 +24,19 @@ namespace AMDGPU {
 
 bool isWaitInstr(MachineInstr &MI) {
   unsigned Opcode = SIInstrInfo::getNonSoftWaitcntOpcode(MI.getOpcode());
-  return Opcode == AMDGPU::S_WAITCNT ||
-         (Opcode == AMDGPU::S_WAITCNT_VSCNT && MI.getOperand(0).isReg() &&
-          MI.getOperand(0).getReg() == AMDGPU::SGPR_NULL) ||
-         Opcode == AMDGPU::S_WAIT_LOADCNT_DSCNT ||
-         Opcode == AMDGPU::S_WAIT_STORECNT_DSCNT ||
-         Opcode == AMDGPU::S_WAITCNT_lds_direct ||
-         Opcode == AMDGPU::WAIT_ASYNCMARK ||
-         AMDGPU::counterTypeForInstr(Opcode).has_value();
+  switch (Opcode) {
+  case AMDGPU::S_WAITCNT:
+  case AMDGPU::S_WAIT_LOADCNT_DSCNT:
+  case AMDGPU::S_WAIT_STORECNT_DSCNT:
+  case AMDGPU::S_WAITCNT_lds_direct:
+  case AMDGPU::WAIT_ASYNCMARK:
+    return true;
+  case AMDGPU::S_WAITCNT_VSCNT:
+    return MI.getOperand(0).isReg() &&
+           MI.getOperand(0).getReg() == AMDGPU::SGPR_NULL;
+  default:
+    return AMDGPU::counterTypeForInstr(Opcode).has_value();
+  }
 }
 
 bool isNonWaitcntMetaInst(const MachineInstr &MI) {
@@ -55,8 +60,7 @@ Waitcnt decode(const MachineInstr &MI, const IsaVersion &IV) {
   Waitcnt W;
   switch (Opcode) {
   case AMDGPU::S_WAITCNT:
-    // Like the old pass, legacy S_WAITCNT is not modelled on targets with
-    // extended wait counts (SIW:1922); WaitcntRewriter leaves it alone.
+    // Ignore S_WAITCNT on targets with extended counters.
     if (IV.Major >= 12)
       return W;
     return decodeWaitcnt(IV, GetImm());
@@ -69,10 +73,7 @@ Waitcnt decode(const MachineInstr &MI, const IsaVersion &IV) {
   case AMDGPU::S_WAIT_STORECNT_DSCNT:
     return decodeStorecntDscnt(IV, GetImm());
   case AMDGPU::WAIT_ASYNCMARK:
-    // TODO(App. B): async marks. Until then, drain everything a mark can
-    // cover: before gfx12.5 the mark counts all LOAD_CNT operations
-    // (SIW:1415-1418). Counters absent on the target are ignored by the
-    // walk.
+    // FIXME: ASYNCMARKs are not implemented so this is a safe approximation.
     W.set(LOAD_CNT, 0);
     W.set(ASYNC_CNT, 0);
     W.set(TENSOR_CNT, 0);
@@ -95,17 +96,16 @@ getPrecedingWaitsBegin(MachineBasicBlock &MBB,
                        MachineBasicBlock::instr_iterator It) {
   MachineBasicBlock::instr_iterator Begin = It;
   while (Begin != MBB.instr_begin()) {
-    MachineInstr &Prev = *std::prev(Begin);
-    if (!isWaitInstr(Prev) && !isNonWaitcntMetaInst(Prev))
+    MachineBasicBlock::instr_iterator Prev = std::prev(Begin);
+    if (!isWaitInstr(*Prev) && !isNonWaitcntMetaInst(*Prev))
       break;
-    --Begin;
+    Begin = Prev;
   }
   return Begin;
 }
 
 bool isNextNonMetaEndpgm(MachineBasicBlock &MBB,
                          MachineBasicBlock::instr_iterator It) {
-  // Port of SIInsertWaitcnts::isNextENDPGM (SIW:2660-2684).
   MachineFunction::iterator BlockIt = MBB.getIterator();
   MachineFunction::iterator BlockEnd = MBB.getParent()->end();
   while (true) {
@@ -119,6 +119,17 @@ bool isNextNonMetaEndpgm(MachineBasicBlock &MBB,
       return It->getOpcode() == AMDGPU::S_ENDPGM;
     ++It;
   }
+}
+
+bool definesAnyRUs(const SIRegisterInfo &TRI, const MachineInstr &MI,
+                   const DenseSet<MCRegUnit> &RUs) {
+  for (const MachineOperand &Def : MI.defs()) {
+    for (MCRegUnit RU : TRI.regunits(Def.getReg())) {
+      if (RUs.contains(RU))
+        return true;
+    }
+  }
+  return false;
 }
 
 bool trackedRegsOverlap(const SIRegisterInfo &TRI, MCRegister A, MCRegister B) {
