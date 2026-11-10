@@ -6,6 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+
+// FIXME: Tests are extensively written by AI (at least all the new ones);
+//        Carefully review them!
+
 #include "AMDGPUEventTracking.h"
 #include "AMDGPUUnitTests.h"
 #include "AMDGPUWaitcntUtils.h"
@@ -873,6 +877,124 @@ body:             |
   // TENSOR_CNT does not exist on gfx12.00: nothing to widen.
   EXPECT_FALSE(ET.widenCount(AMDGPU::TENSOR_CNT));
   EXPECT_EQ(ET.count(AMDGPU::TENSOR_CNT), 0u);
+}
+
+namespace {
+/// Two loads in bb.0, then a diamond: bb.0 -> {bb.1, bb.2} -> bb.3.
+constexpr const char *DiamondMIR = R"(
+name:            Diamond
+body:             |
+  bb.0:
+    liveins: $vgpr4_vgpr5, $vgpr6_vgpr7, $scc
+    $vgpr4 = GLOBAL_LOAD_DWORD $vgpr4_vgpr5, 0, 0, implicit $exec
+    $vgpr6 = GLOBAL_LOAD_DWORD $vgpr6_vgpr7, 0, 0, implicit $exec
+    S_CBRANCH_SCC1 %bb.2, implicit $scc
+    S_BRANCH %bb.1
+
+  bb.1:
+    S_BRANCH %bb.3
+
+  bb.2:
+    S_BRANCH %bb.3
+
+  bb.3:
+    S_ENDPGM 0
+...
+)";
+} // namespace
+
+/// markIndeterminate widens the count. A partial drain keeps the flag; only a
+/// drain to 0 clears it.
+TEST_F(AMDGPUGFX12EventTrackingTest, IndeterminateAndDrain) {
+  ASSERT_TRUE(parseMIR(DiamondMIR));
+  MachineFunction &MF = getMF("Diamond");
+  MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
+  MachineInstr &Load = BB0.front();
+
+  EventTracker &ET = TrackerGetter(BB0);
+  ET.enterBlock(TrackerGetter);
+  const unsigned Cap = getCounter(AMDGPU::STORE_CNT, Counters).getLimit() - 1;
+
+  // Indeterminate with an empty timeline (e.g. unknown stores at entry).
+  ET.markIndeterminate(AMDGPU::STORE_CNT);
+  EXPECT_TRUE(ET.isIndeterminate(AMDGPU::STORE_CNT));
+  EXPECT_EQ(ET.count(AMDGPU::STORE_CNT), Cap);
+  EXPECT_TRUE(ET.getTimeline(AMDGPU::STORE_CNT).empty());
+
+  ET.record(Load, SingleHWEvent::encode(HWEvents::VMEM_WRITE_ACCESS));
+  EXPECT_EQ(ET.count(AMDGPU::STORE_CNT), Cap);
+
+  ET.drain(AMDGPU::STORE_CNT, 1);
+  EXPECT_TRUE(ET.isIndeterminate(AMDGPU::STORE_CNT));
+
+  ET.drain(AMDGPU::STORE_CNT, 0);
+  EXPECT_FALSE(ET.isIndeterminate(AMDGPU::STORE_CNT));
+  EXPECT_TRUE(TrackerRecordsChecker(ET, AMDGPU::STORE_CNT).unused());
+  EXPECT_EQ(ET.getPendingEvents(AMDGPU::STORE_CNT), HWEvents());
+}
+
+/// The cached pending events follow record, partial drain, capped-record
+/// pruning and joins.
+TEST_F(AMDGPUGFX12EventTrackingTest, PendingEventsCache) {
+  ASSERT_TRUE(parseMIR(DiamondMIR));
+  MachineFunction &MF = getMF("Diamond");
+  MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
+  MachineInstr &Load = BB0.front();
+
+  EventTracker &ET = TrackerGetter(BB0);
+  ET.enterBlock(TrackerGetter);
+  // STORE_CNT tracks two kinds; the MI does not matter to the tracker.
+  ET.record(Load, SingleHWEvent::encode(HWEvents::SCRATCH_WRITE_ACCESS));
+  ET.record(Load, SingleHWEvent::encode(HWEvents::VMEM_WRITE_ACCESS));
+  EXPECT_EQ(ET.getPendingEvents(AMDGPU::STORE_CNT),
+            HWEvents::SCRATCH_WRITE_ACCESS | HWEvents::VMEM_WRITE_ACCESS);
+
+  // Partial drain removes the older (scratch) record.
+  ET.drain(AMDGPU::STORE_CNT, 1);
+  EXPECT_EQ(ET.getPendingEvents(AMDGPU::STORE_CNT),
+            HWEvents::VMEM_WRITE_ACCESS);
+
+  // Join into bb.1 rebuilds the cache.
+  MachineBasicBlock &BB1 = *MF.getBlockNumbered(1);
+  EventTracker &ET1 = TrackerGetter(BB1);
+  ET1.enterBlock(TrackerGetter);
+  EXPECT_EQ(ET1.getPendingEvents(AMDGPU::STORE_CNT),
+            HWEvents::VMEM_WRITE_ACCESS);
+#ifndef NDEBUG
+  ET.verify();
+  ET1.verify();
+#endif
+}
+
+/// The indeterminate flag is sticky across joins: one predecessor in the
+/// state is enough. It takes part in operator==.
+TEST_F(AMDGPUGFX12EventTrackingTest, IndeterminatePropagatesThroughJoin) {
+  ASSERT_TRUE(parseMIR(DiamondMIR));
+  MachineFunction &MF = getMF("Diamond");
+  MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
+  MachineBasicBlock &BB1 = *MF.getBlockNumbered(1);
+  MachineBasicBlock &BB2 = *MF.getBlockNumbered(2);
+  MachineBasicBlock &BB3 = *MF.getBlockNumbered(3);
+
+  visitAll(BB0);
+  visitAll(BB1,
+           [](EventTracker &ET) { ET.markIndeterminate(AMDGPU::STORE_CNT); });
+  visitAll(BB2);
+  EventTracker &ET3 = visitAll(BB3);
+
+  EXPECT_FALSE(TrackerGetter(BB2).isIndeterminate(AMDGPU::STORE_CNT));
+  EXPECT_TRUE(ET3.isIndeterminate(AMDGPU::STORE_CNT));
+  EXPECT_FALSE(ET3.isIndeterminate(AMDGPU::LOAD_CNT));
+  // Count is the max over predecessors: the widened one.
+  EXPECT_EQ(ET3.count(AMDGPU::STORE_CNT),
+            TrackerGetter(BB1).count(AMDGPU::STORE_CNT));
+
+  // Two states that differ only by the flag are not equal.
+  EventTracker A(BB1, Counters), B(BB1, Counters);
+  A.markIndeterminate(AMDGPU::STORE_CNT);
+  B.widenCount(AMDGPU::STORE_CNT);
+  ASSERT_EQ(A.count(AMDGPU::STORE_CNT), B.count(AMDGPU::STORE_CNT));
+  EXPECT_FALSE(A == B);
 }
 
 } // namespace

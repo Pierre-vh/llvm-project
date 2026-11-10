@@ -126,6 +126,7 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
     // carried over from a backedge and the other is from a more recent
     // iteration.
     CD.Timeline.push_back(Rec);
+
     CD.PendingEventsCache |= Rec.getKind();
 
     LLVM_DEBUG(if (EventTrackerPrintAll) {
@@ -145,6 +146,7 @@ bool EventTracker::widenCount(InstCounterType T) {
   CounterData &CD = Counters[T];
   if (!CD.IC || !CD.IC->hasLimit())
     return false;
+  LLVM_DEBUG(dbgs() << "[EventTracker] Widening " << CD.IC->getName() << "\n");
   CD.Count = CD.IC->getLimit() - 1;
   assert(isCapped(T));
   return true;
@@ -159,6 +161,8 @@ void EventTracker::drain(InstCounterType T, unsigned N) {
   if (N == 0) {
     CD.Timeline.clear();
     CD.Count = 0;
+
+    CD.IsIndeterminate = false;
   } else {
     CD.Count = std::min(CD.Count, N);
 
@@ -185,6 +189,20 @@ void EventTracker::drain(InstCounterType T, unsigned N) {
 #endif
 }
 
+void EventTracker::markIndeterminate(InstCounterType T) {
+  CounterData &CD = Counters[T];
+  if (!CD.IC)
+    return;
+
+  LLVM_DEBUG(dbgs() << "[EventTracker] Marking as indeterminate: " << CD.IC->getName() << "\n");
+  CD.IsIndeterminate = true;
+  widenCount(T);
+}
+
+bool EventTracker::isIndeterminate(InstCounterType T) const {
+  return Counters[T].IsIndeterminate;
+}
+
 bool EventTracker::operator==(const EventTracker &Other) const {
   assert(Counters.size() == Other.Counters.size());
   // Timelines are kept sorted by compareRecords, which is a strict total order
@@ -192,7 +210,8 @@ bool EventTracker::operator==(const EventTracker &Other) const {
   // same age), so an element-wise compare is exact.
   for (const auto &[A, B] : zip_equal(Counters, Other.Counters)) {
     assert(A.IC == B.IC && "comparing trackers with different counters");
-    if (A.Count != B.Count || A.Timeline != B.Timeline)
+    if (A.Count != B.Count || A.Timeline != B.Timeline ||
+        A.IsIndeterminate != B.IsIndeterminate)
       return false;
   }
   return true;
@@ -366,6 +385,8 @@ void EventTracker::clear() {
   for (CounterData &C : Counters) {
     C.Timeline.clear();
     C.Count = 0;
+    C.IsIndeterminate = false;
+    C.PendingEventsCache = HWEvents();
   }
 }
 
@@ -392,6 +413,8 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
       // The merged count is the max across predecessors.
       CData.Count = std::max(CData.Count, PredCData.Count);
 
+      CData.IsIndeterminate |= PredCData.IsIndeterminate;
+
       for (EventTrackerRecord &PredEntry : PredCData.Timeline) {
         // At a join, collapse records from all predecessors with the same
         // identity (MI+Kind) into a single record whose age is the minimum
@@ -407,6 +430,7 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
 
     auto AccVals = Acc.values();
     CData.Timeline.append(AccVals.begin(), AccVals.end());
+
     CData.PendingEventsCache = calcPendingEvents(CData);
 
     // Sort records by descending age for consistent iteration.
@@ -426,7 +450,8 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
 void EventTracker::print(raw_ostream &OS, const CounterData &CD,
                          unsigned Indent) {
   OS.indent(Indent) << CD.IC->getName() << " (Count=" << CD.Count
-                    << ", Timeline=" << CD.Timeline.size() << ")\n";
+                    << ", Timeline=" << CD.Timeline.size()
+                    << ", Indeterminate=" << CD.IsIndeterminate << ")\n";
   for (const EventTrackerRecord &E : CD.Timeline) {
     OS.indent(Indent + 2);
     E.print(OS);

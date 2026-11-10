@@ -186,16 +186,35 @@ public:
   /// \pre \p Event belongs to at least one \ref InstCounterType.
   void record(MachineInstr &MI, SingleHWEvent Event);
 
-  /// Set the \ref count of \p T to its limit (\ref isCapped returns true).
+  /// Set the \ref count of \p T to its limit ( \ref isCapped returns true).
   /// The timeline is unaffected. If the counter isn't tracked or has no limit,
   /// does nothing.
   /// \returns true if the count was widened, false otherwise.
   bool widenCount(InstCounterType T);
 
+  /// \returns true if the \ref count of \p T is at its max (Limit of the
+  /// counter minus 1), and new events do not increment the counter value
+  /// anymore.
+  bool isCapped(InstCounterType T) const { return isCapped(Counters[T]); }
+
   /// Drains the timeline of \p T such that:
   /// - The \ref count of \p T is no higher than \p N.
   /// - There are no records in the timeline with an age >= \p N.
+  /// If \p N = 0, then \p T is no longer in the indeterminate state.
   void drain(InstCounterType T, unsigned N = 0);
+
+  /// Mark \p T as being indeterminate, which means that we only track a subset
+  /// of events.
+  /// Implies \ref widenCount, only cleared by a \ref drain 0, and persists
+  /// across joins.
+  /// FIXME: I feel like this is a bit of a breach of the separation of
+  /// concerns. We don't store OoO bit here but we store indeterminate because
+  /// it's arbitrary/easier. Reevaluate that split. Either trim this and
+  /// generalize it to just a system of abstract flags, or don't store it here?
+  void markIndeterminate(InstCounterType T);
+
+  /// \returns true if the counter \p T is in the indeterminate state.
+  bool isIndeterminate(InstCounterType T) const;
 
   /// \returns a conservative estimate of the current value of the counter \p T
   /// (a maximum value across all possible CFG paths).
@@ -203,11 +222,6 @@ public:
 
   /// \returns the set of pending HWEvents for \p T.
   HWEvents getPendingEvents(InstCounterType T) const;
-
-  /// \returns true if the \ref count of \p T is at its max (Limit of the
-  /// counter minus 1), and new events do not increment the counter value
-  /// anymore.
-  bool isCapped(InstCounterType T) const { return isCapped(Counters[T]); }
 
   /// Drain all records of \p T that have an age >= the cap of \p T.
   void drainCappedRecords(InstCounterType T);
@@ -262,6 +276,8 @@ private:
     /// Cached pending events. Updated when recording new events, recomputed
     /// whenever events are removed.
     HWEvents PendingEventsCache;
+
+    bool IsIndeterminate = false;
 
     // TODO: We could imagine storing the per-predecessor age for incoming
     // events. We could achieve that by storing that as a map of ((ID, Pred),

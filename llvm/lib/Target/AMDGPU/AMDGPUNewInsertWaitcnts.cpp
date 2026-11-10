@@ -433,12 +433,14 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsAtEnd(
     // Do not use getAllZeroWaitcnt - this has to be more thorough: drain every
     // single counter that has even just one event. This is necessary as
     // ForceDrain is one of the guards that ensure we reach a fixpoint.
+    // An indeterminate counter can have an empty timeline (events we don't
+    // track), and a count without records must be drained too, or the
+    // out-state of this block would still depend on its in-state.
     for (const AMDGPUInstCounter &IC : InstCounters) {
       InstCounterType T = IC.getType();
-      if (!S.ET.getTimeline(T).empty())
+      if (!S.ET.getTimeline(T).empty() || S.ET.count(T) > 0 ||
+          S.ET.isIndeterminate(T))
         W.set(T, 0);
-      else
-        assert(S.ET.count(T) == 0);
     }
   }
 
@@ -836,7 +838,9 @@ Waitcnt AMDGPUNewInsertWaitcnts::removeNoOpWaits(const State &S,
   for (const AMDGPUInstCounter &IC : InstCounters) {
     InstCounterType T = IC.getType();
     unsigned Val = W.get(T);
-    if (Val != ~0u && Val >= S.ET.count(T))
+    // An indeterminate counter has events we don't track, so its count is
+    // not an upper bound (e.g. NoLimit counters can't be widened).
+    if (Val != ~0u && Val >= S.ET.count(T) && !S.ET.isIndeterminate(T))
       W.set(T, ~0u);
   }
 
@@ -903,11 +907,11 @@ void AMDGPUNewInsertWaitcnts::recordEvents(State &S, MachineInstr &MI) {
   for (HWEvents E : getEventsFor(MI, ST, IsExpertMode, IsTgSplit))
     S.ET.record(MI, SingleHWEvent::encode(E));
 
-  // For in-order counter, prune all counters above the cap.
+  // For in-order counters, drain any records above the cap.
   for (const AMDGPUInstCounter &IC : InstCounters) {
-    if (!isOutOfOrder(S, IC.getType())) {
-      S.ET.drainCappedRecords(IC.getType());
-    }
+    InstCounterType T = IC.getType();
+    if (!isOutOfOrder(S, T))
+      S.ET.drainCappedRecords(T);
   }
 
   // The waitexp operand of VINTERP is an implicit EXP_CNT wait (SIW:2744-2746).
@@ -923,7 +927,11 @@ void AMDGPUNewInsertWaitcnts::recordEvents(State &S, MachineInstr &MI) {
   // TODO: ASYNCMARK push (App. B).
 }
 
-void AMDGPUNewInsertWaitcnts::setStateOnFunctionEntryOrReturn(State &S) {}
+void AMDGPUNewInsertWaitcnts::setStateOnFunctionEntryOrReturn(State &S) {
+  // A caller (at function entry) or a callee (after a call) may leave stores in
+  // flight that we don't track.
+  S.ET.markIndeterminate(STORE_CNT);
+}
 
 Waitcnt
 AMDGPUNewInsertWaitcnts::getWaitsForcedAfter(const MachineInstr &MI) const {
@@ -1026,9 +1034,8 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
   // TODO: AsyncMark state join too
 
   bool IsEntryWithWaits = MBB.isEntryBlock() && EntryBlocksNeedWaits;
-  if (IsEntryWithWaits) {
-    // TODO: Add indeterminate state; flag it here.
-  }
+  if (IsEntryWithWaits)
+    setStateOnFunctionEntryOrReturn(S);
 
   // TODO: VCCZ schtuff
 
