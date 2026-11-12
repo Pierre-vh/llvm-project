@@ -181,27 +181,30 @@ private:
   /// These are state-independent waits which are required by the ISA.
   Waitcnt getAlwaysRequiredWaitsBefore(const MachineInstr &MI) const;
 
-  /// \returns true if \p MI must wait for record \p R of counter \p T, through
-  /// a register (RAW, WAW, WAR) or a memory dependency.
+  /// \returns true if \p MI must wait for record \p R of counter \p IC,
+  /// through a register (RAW, WAW, WAR) or a memory dependency.
   bool hasDependencyOn(const State &S, const MachineInstr &MI,
-                       const EventTrackerRecord &R, InstCounterType T) const;
+                       const EventTrackerRecord &R,
+                       const AMDGPUInstCounter &IC) const;
 
   /// \returns true if a register operand of \p MI has a dependency on an
-  /// operand of \p P via the counter \p T.
+  /// operand of \p P via the counter \p IC.
   /// (see \ref getOperandsTrackedByCounter).
   bool hasRegDependencyOn(const State &S, const MachineInstr &MI,
-                          const MachineInstr &P, InstCounterType T) const;
+                          const MachineInstr &P,
+                          const AMDGPUInstCounter &IC) const;
 
-  /// \returns true if \p MI has a memory dependency on \p P via the counter \p
-  /// T. (e.g. LDS access after aliasing DMAs)
+  /// \returns true if \p MI has a memory dependency on \p P via the counter
+  /// \p IC. (e.g. LDS access after aliasing DMAs)
   bool hasMemDependencyOn(const MachineInstr &MI, const MachineInstr &P,
-                          InstCounterType T) const;
+                          const AMDGPUInstCounter &IC) const;
 
   /// \returns true if operand \p Op of \p MI can depend on a pending event of
-  /// counter \p T, based on its register class, use/def role and, for WAW and
+  /// counter \p IC, based on its register class, use/def role and, for WAW and
   /// EXP_CNT uses, the pending events in \p S.
   bool isOperandCheckedOn(const State &S, const MachineInstr &MI,
-                          const MachineOperand &Op, InstCounterType T) const;
+                          const MachineOperand &Op,
+                          const AMDGPUInstCounter &IC) const;
 
   /// \returns true if the VMEM instruction \p MI writing VGPR \p Reg needs no
   /// WAW wait: the target writes VGPRs in order and every pending write to
@@ -213,11 +216,11 @@ private:
   /// VM_CNT-only producers that write \p Reg.
   HWEvents getPendingVGPRWriteEvents(const State &S, MCRegister Reg) const;
 
-  /// \returns the register to check on \p T for operand register \p Reg of
+  /// \returns the register to check on \p IC for operand register \p Reg of
   /// \p MI: the enclosing 32-bit VGPR if a 16-bit write may clobber the other
   /// half (D16Writes32BitVgpr), else \p Reg.
   MCRegister getRegToCheck(const State &S, const MachineInstr &MI,
-                           MCRegister Reg, InstCounterType T) const;
+                           MCRegister Reg, const AMDGPUInstCounter &IC) const;
 
   /// \returns true if there is a pending write to \p Ref tracked via \p T.
   bool hasPendingWriteTo(const State &S, MCRegister Reg,
@@ -279,9 +282,13 @@ private:
       Waitcnt &W, const State &S, InstCounterType T, bool DrainAll,
       function_ref<bool(const EventTrackerRecord &)> Pred) const;
 
+  /// \returns true if, given \p S, a waitcnt N for \p T will have to become a
+  /// conservative waitcnt 0 instead.
+  bool willNeedWaitZero(const State &S, InstCounterType T) const;
+
   /// \returns the wait on \p T that guarantees completion of a record of age
-  /// \p Age: 0 if \p T is out of order or a flat access is pending, else
-  /// \p Age capped at the counter limit - 1.
+  /// \p Age: 0 if \p willNeedWaitZero returns true, else \p Age capped at the
+  /// counter limit - 1.
   unsigned waitFor(const State &S, InstCounterType T, unsigned Age) const;
 
   /// \returns true if waits on \p T (LOAD_CNT or DS_CNT) must be 0 because a
@@ -507,7 +514,7 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsRequiredBy(const State &S,
   for (const AMDGPUInstCounter &IC : InstCounters) {
     waitForMatchingRecords(W, S, IC.getType(), /*DrainAll=*/false,
                            [&](const EventTrackerRecord &R) {
-                             return hasDependencyOn(S, MI, R, IC.getType());
+                             return hasDependencyOn(S, MI, R, IC);
                            });
   }
 
@@ -616,37 +623,32 @@ bool AMDGPUNewInsertWaitcnts::writesCallAddrOrDst(
   });
 }
 
-bool AMDGPUNewInsertWaitcnts::hasDependencyOn(const State &S,
-                                              const MachineInstr &MI,
-                                              const EventTrackerRecord &R,
-                                              InstCounterType T) const {
-  // TODO(T6): UNKNOWN_STORE records have no producer MI and must never match:
-  //   if (R.getKind() == UNKNOWN_STORE)
-  //     return false;
+bool AMDGPUNewInsertWaitcnts::hasDependencyOn(
+    const State &S, const MachineInstr &MI, const EventTrackerRecord &R,
+    const AMDGPUInstCounter &IC) const {
   const MachineInstr &P = *R.getMI();
 
   // TODO(perf, R7): this is called for every (MI, record) pair, and the
   // register checks below scan the timelines again (WAW exemption, D16).
   // Precompute per-MI data if it shows up in profiles.
-  return hasRegDependencyOn(S, MI, P, T) || hasMemDependencyOn(MI, P, T);
+  return hasRegDependencyOn(S, MI, P, IC) || hasMemDependencyOn(MI, P, IC);
 }
 
-bool AMDGPUNewInsertWaitcnts::hasRegDependencyOn(const State &S,
-                                                 const MachineInstr &MI,
-                                                 const MachineInstr &P,
-                                                 InstCounterType T) const {
+bool AMDGPUNewInsertWaitcnts::hasRegDependencyOn(
+    const State &S, const MachineInstr &MI, const MachineInstr &P,
+    const AMDGPUInstCounter &IC) const {
   // Registers of P that MI must wait on T for (defs, or EXP_CNT locks).
   SmallVector<const MachineOperand *, 4> Tracked;
-  getOperandsTrackedByCounter(TII, TRI, MRI, P, T, Tracked);
+  getOperandsTrackedByCounter(TII, TRI, MRI, P, IC.getType(), Tracked);
   if (Tracked.empty())
     return false;
 
   // RAW, WAW and WAR (EXP_CNT) via MI's operands (SIW:2468-2537).
   for (const MachineOperand &Op : MI.operands()) {
-    if (!Op.isReg() || !Op.getReg() || !isOperandCheckedOn(S, MI, Op, T))
+    if (!Op.isReg() || !Op.getReg() || !isOperandCheckedOn(S, MI, Op, IC))
       continue;
 
-    MCRegister Reg = getRegToCheck(S, MI, Op.getReg().asMCReg(), T);
+    MCRegister Reg = getRegToCheck(S, MI, Op.getReg().asMCReg(), IC);
     if (any_of(Tracked, [&](const MachineOperand *TrackedOp) {
           return trackedRegsOverlap(TRI, Reg, TrackedOp->getReg().asMCReg());
         }))
@@ -655,10 +657,9 @@ bool AMDGPUNewInsertWaitcnts::hasRegDependencyOn(const State &S,
   return false;
 }
 
-bool AMDGPUNewInsertWaitcnts::isOperandCheckedOn(const State &S,
-                                                 const MachineInstr &MI,
-                                                 const MachineOperand &Op,
-                                                 InstCounterType T) const {
+bool AMDGPUNewInsertWaitcnts::isOperandCheckedOn(
+    const State &S, const MachineInstr &MI, const MachineOperand &Op,
+    const AMDGPUInstCounter &IC) const {
   // MI does not read its tied source.
   if (Op.isTied() && Op.isUse() && TII.doesNotReadTiedSource(MI))
     return false;
@@ -671,7 +672,7 @@ bool AMDGPUNewInsertWaitcnts::isOperandCheckedOn(const State &S,
     if (Op.isImplicit() && MI.mayLoadOrStore())
       return false;
 
-    switch (T) {
+    switch (IC.getType()) {
     case LOAD_CNT:
     case SAMPLE_CNT:
     case BVH_CNT:
@@ -691,10 +692,10 @@ bool AMDGPUNewInsertWaitcnts::isOperandCheckedOn(const State &S,
   }
 
   if (Reg == AMDGPU::SCC)
-    return T == KM_CNT;
+    return IC.getType() == KM_CNT;
 
   // Other (scalar) registers are only written asynchronously by SMEM.
-  return T == SmemCounter->getType();
+  return &IC == SmemCounter;
 }
 
 bool AMDGPUNewInsertWaitcnts::isInOrderVGPRWrite(const State &S,
@@ -735,10 +736,10 @@ AMDGPUNewInsertWaitcnts::getPendingVGPRWriteEvents(const State &S,
   return Pending;
 }
 
-MCRegister AMDGPUNewInsertWaitcnts::getRegToCheck(const State &S,
-                                                  const MachineInstr &MI,
-                                                  MCRegister Reg,
-                                                  InstCounterType T) const {
+MCRegister
+AMDGPUNewInsertWaitcnts::getRegToCheck(const State &S, const MachineInstr &MI,
+                                       MCRegister Reg,
+                                       const AMDGPUInstCounter &IC) const {
   // Port of determineVGPR16Dependency (SIW:1418-1457). With
   // D16Writes32BitVgpr, a 16-bit write may clobber the whole 32-bit VGPR, so
   // the other half is checked too if it has a pending write on T and either
@@ -747,15 +748,15 @@ MCRegister AMDGPUNewInsertWaitcnts::getRegToCheck(const State &S,
     return Reg;
 
   MCRegister OtherHalf = getOther16BitHalf(TRI, Reg);
-  if (!OtherHalf || !hasPendingWriteTo(S, OtherHalf, T))
+  if (!OtherHalf || !hasPendingWriteTo(S, OtherHalf, IC.getType()))
     return Reg;
 
   MCRegister Reg32 = TRI.get32BitRegister(Reg);
   if (TII.isVALU(MI, /*AllowLDSDMA=*/false))
     return Reg32;
 
-  HWEvents Events = getEventsFor(MI, ST, IsExpertMode, IsTgSplit) &
-                    getCounter(T, InstCounters).getEvents();
+  HWEvents Events = getEventsFor(MI, ST, IsExpertMode, IsTgSplit);
+  Events &= IC.getEvents();
   return Events.size() > 1 ? Reg32 : Reg;
 }
 
@@ -770,9 +771,9 @@ bool AMDGPUNewInsertWaitcnts::hasPendingWriteTo(const State &S, MCRegister Reg,
   });
 }
 
-bool AMDGPUNewInsertWaitcnts::hasMemDependencyOn(const MachineInstr &MI,
-                                                 const MachineInstr &P,
-                                                 InstCounterType T) const {
+bool AMDGPUNewInsertWaitcnts::hasMemDependencyOn(
+    const MachineInstr &MI, const MachineInstr &P,
+    const AMDGPUInstCounter &IC) const {
   // LDS DMA → LDS access (SIW:2437-2463). Back-to-back LDS DMAs don't wait
   // for each other.
   //
@@ -785,7 +786,7 @@ bool AMDGPUNewInsertWaitcnts::hasMemDependencyOn(const MachineInstr &MI,
   //    but no LDS DMA slot ever gets an EXP_CNT score (the slot bookkeeping
   //    is only in the non-EXP branch of updateByEvent), so it is dead code
   //    and not ported.
-  if (T == LOAD_CNT && TII.isNonAsyncLdsDmaWrite(P) &&
+  if (IC.getType() == LOAD_CNT && TII.isNonAsyncLdsDmaWrite(P) &&
       !SIInstrInfo::mayWriteLDSThroughDMA(MI) &&
       mayAccessLDSWrittenByDMA(AA, MI, P))
     return true;
@@ -796,8 +797,7 @@ bool AMDGPUNewInsertWaitcnts::hasMemDependencyOn(const MachineInstr &MI,
   // dependent map of loaded addresses (SLoadAddresses) and forces a wait
   // whenever the address matches, even if the load has completed. Here only
   // pending loads match. The wait still goes to 0, since SMEM is out of order.
-  if (T == SmemCounter->getType() && TII.isSMRD(P) &&
-      mayStoreToLoadedAddress(MI, P))
+  if (&IC == SmemCounter && TII.isSMRD(P) && mayStoreToLoadedAddress(MI, P))
     return true;
 
   return false;
@@ -985,17 +985,27 @@ void AMDGPUNewInsertWaitcnts::waitForAll(Waitcnt &W, const State &S,
 void AMDGPUNewInsertWaitcnts::waitForMatchingRecords(
     Waitcnt &W, const State &S, InstCounterType T, bool DrainAll,
     function_ref<bool(const EventTrackerRecord &)> Pred) const {
+  const unsigned CurWait = W.get(T);
+  if (CurWait == 0)
+    return; // nothing we do here can tighten the wait.
+
   // The timeline is sorted by descending age, so walking it in reverse visits
   // the youngest records first. The first match has the minimum age, i.e. the
   // strongest wait any match would need: stop there.
+  const bool WillNeedWaitZero = willNeedWaitZero(S, T);
   for (const EventTrackerRecord &R : reverse(S.ET.getTimeline(T))) {
-    if (Pred(R)) {
-      if (DrainAll)
-        W.add(T, 0);
-      else
-        W.add(T, waitFor(S, T, R.getAge()));
+    // Stop the visit if nothing we do here can tighten the wait.
+    if (!DrainAll && R.getAge() >= CurWait && !WillNeedWaitZero)
       return;
-    }
+
+    if (!Pred(R))
+      continue;
+
+    if (DrainAll)
+      W.add(T, 0);
+    else
+      W.add(T, waitFor(S, T, R.getAge()));
+    return;
   }
 }
 
@@ -1022,10 +1032,14 @@ bool AMDGPUNewInsertWaitcnts::flatForcesZero(const State &S,
          any_of(S.ET.getTimeline(LOAD_CNT), IsPendingFlat);
 }
 
+bool AMDGPUNewInsertWaitcnts::willNeedWaitZero(const State &S,
+                                               InstCounterType T) const {
+  return isOutOfOrder(S, T) || flatForcesZero(S, T);
+}
+
 unsigned AMDGPUNewInsertWaitcnts::waitFor(const State &S, InstCounterType T,
                                           unsigned Age) const {
-  // Port of determineWaitForScore (SIW:1362-1388).
-  if (flatForcesZero(S, T) || isOutOfOrder(S, T))
+  if (willNeedWaitZero(S, T))
     return 0;
 
   // If the counter has been maxed out, avoid overflow by waiting for
@@ -1169,17 +1183,9 @@ bool AMDGPUNewInsertWaitcnts::isSafeToDeallocVGPRs(
 }
 
 bool AMDGPUNewInsertWaitcnts::hasPendingSMEM(const State &S) const {
-  // Port of ScoreBrackets.hasPendingEvent(SMEM_ACCESS). The SMEM counter also
-  // tracks other events (LDS on gfx9, for instance), so look at the kind of
-  // the records. A record disappears from the timeline when a wait drains it,
-  // so this is "has an SMEM that was not waited for".
-  // [unverified] Records pruned from in-order counters by drainCappedRecords
-  // (T3) are treated as completed; SMEM is out-of-order, so none are pruned.
   assert(SmemCounter && "no counter tracks SMEM");
-  return any_of(S.ET.getTimeline(SmemCounter->getType()),
-                [](const EventTrackerRecord &R) {
-                  return HWEvents(R.getKind()) == HWEvents::SMEM_ACCESS;
-                });
+  return S.ET.getPendingEvents(SmemCounter->getType())
+      .contains(HWEvents::SMEM_ACCESS);
 }
 
 bool AMDGPUNewInsertWaitcnts::apply(const Solution &Sol) {
