@@ -143,6 +143,19 @@ bool trackedRegsOverlap(const SIRegisterInfo &TRI, MCRegister A, MCRegister B) {
   return TRI.regsOverlap(A, B);
 }
 
+bool DependencyQuery::overlaps(const SIRegisterInfo &TRI,
+                               MCRegister Reg) const {
+  // Same rules as trackedRegsOverlap, with the checked side precomputed.
+  if (!Reg.isValid())
+    return false;
+  if (Reg == AMDGPU::SCC)
+    return ChecksSCC;
+  if (!TRI.isInAllocatableClass(Reg))
+    return false;
+  return any_of(TRI.regunits(Reg),
+                [&](MCRegUnit U) { return binary_search(RegUnits, U); });
+}
+
 bool updatesVMCntOnly(const MachineInstr &MI) {
   return (SIInstrInfo::isVMEM(MI) && !SIInstrInfo::isFLAT(MI)) ||
          SIInstrInfo::isFLATGlobal(MI) || SIInstrInfo::isFLATScratch(MI);
@@ -264,12 +277,20 @@ void getOperandsTrackedByCounter(const SIInstrInfo &TII,
   }
 }
 
+static bool isLDSOrFlatMemOperand(const MachineMemOperand *MMO) {
+  unsigned AS = MMO->getAddrSpace();
+  return AS == AMDGPUAS::LOCAL_ADDRESS || AS == AMDGPUAS::FLAT_ADDRESS;
+}
+
+bool hasLDSOrFlatMemOperand(const MachineInstr &MI) {
+  return any_of(MI.memoperands(), isLDSOrFlatMemOperand);
+}
+
 bool mayAccessLDSWrittenByDMA(AAResults *AA, const MachineInstr &MI,
                               const MachineInstr &DMA) {
   bool AccessesLDS = false;
   for (const MachineMemOperand *MMO : MI.memoperands()) {
-    unsigned AS = MMO->getAddrSpace();
-    if (AS != AMDGPUAS::LOCAL_ADDRESS && AS != AMDGPUAS::FLAT_ADDRESS)
+    if (!isLDSOrFlatMemOperand(MMO))
       continue;
     if (!MMO->getValue() || !MMO->getAAInfo())
       return true;

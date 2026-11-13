@@ -17,6 +17,7 @@
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/MC/MCRegister.h"
 #include <optional>
 
@@ -81,6 +82,37 @@ bool definesAnyRUs(const SIRegisterInfo &TRI, const MachineInstr &MI,
 /// do. SCC is the only exception: it only overlaps with itself.
 bool trackedRegsOverlap(const SIRegisterInfo &TRI, MCRegister A, MCRegister B);
 
+/// Per-(MI, counter) dependency check inputs that don't depend on the
+/// record being checked. This is computed once from the current state and then
+/// matched against each record on the counter's timeline.
+struct DependencyQuery {
+  /// Sorted, unique register units of the registers of MI that could conflict
+  /// (RAW, WAW, ...) with an in-flight event on the instruction counter. Only
+  /// contains registers in an allocatable class, and never SCC (see
+  /// \ref ChecksSCC for that).
+  SmallVector<MCRegUnit, 16> RegUnits;
+  /// MI checks SCC on the counter.
+  bool ChecksSCC = false;
+  /// MI may access LDS written by a pending LDS DMA (LOAD_CNT only).
+  /// Conservative approximation used to avoid doing AA checks when they are
+  /// clearly not needed.
+  bool MayDependOnLDSDMA = false;
+  /// MI may store to an address read by a pending SMEM load (SMEM counter
+  /// only). Conservative in the same way as \ref MayDependOnLDSDMA.
+  bool MayDependOnSMEMLoad = false;
+
+  bool hasRegChecks() const { return ChecksSCC || !RegUnits.empty(); }
+
+  /// \returns false if no record of the counter can match.
+  bool canMatch() const {
+    return hasRegChecks() || MayDependOnLDSDMA || MayDependOnSMEMLoad;
+  }
+
+  /// \returns true if \p Reg overlaps a checked register, with the rules of
+  /// \ref trackedRegsOverlap.
+  bool overlaps(const SIRegisterInfo &TRI, MCRegister Reg) const;
+};
+
 /// \returns true if \p MI is a memory access that only increments the vector
 /// memory counter. Generic FLAT instructions may also access LDS and are
 /// excluded.
@@ -123,6 +155,11 @@ void getOperandsTrackedByCounter(const SIInstrInfo &TII,
                                  const MachineRegisterInfo &MRI,
                                  const MachineInstr &MI, InstCounterType T,
                                  SmallVectorImpl<const MachineOperand *> &Ops);
+
+/// \returns true if \p MI has an LDS or flat memory operand, i.e. may access
+/// LDS according to its memory operands. Necessary for
+/// \ref mayAccessLDSWrittenByDMA to return true.
+bool hasLDSOrFlatMemOperand(const MachineInstr &MI);
 
 /// \returns true if \p MI may access LDS memory written by the LDS DMA
 /// instruction \p DMA. Only LDS and flat memory operands of \p MI are
