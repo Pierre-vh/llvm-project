@@ -294,6 +294,12 @@ void EventTracker::verify() const {
       }
     }
 
+    // A pending record implies a non-zero count.
+    if (!C.Timeline.empty() && C.Count == 0) {
+      OnError();
+      llvm_unreachable("records are pending but the count is zero");
+    }
+
     // Check that the timeline is sorted.
     if (!is_sorted(C.Timeline, compareRecords)) {
       OnError();

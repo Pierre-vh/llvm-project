@@ -306,10 +306,6 @@ public:
     return It == Solutions.end() ? nullptr : &It->second;
   }
 
-  const BasicBlockSolution &operator[](const MachineBasicBlock &MBB) const {
-    return Solutions.at(&MBB);
-  }
-
   BasicBlockSolution &operator[](const MachineBasicBlock &MBB) {
     return Solutions[&MBB];
   }

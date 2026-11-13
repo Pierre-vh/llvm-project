@@ -127,11 +127,11 @@ private:
   /// Walks \p MBB from its in-state (rebuilt from the predecessors'
   /// \p OutStates) and leaves its out-state in \p OutStates. Blocks in
   /// \p ForceDrain are fully drained before their terminator. Decisions are
-  /// recorded in \p Sol if non-null.
+  /// recorded in \p Sol.
   void walkBlock(MachineBasicBlock &MBB,
                  DenseMap<const MachineBasicBlock *, State> &OutStates,
                  const DenseSet<const MachineBasicBlock *> &ForceDrain,
-                 Solution *Sol);
+                 Solution &Sol);
 
   /// \param S the state of \p MBB before its terminator
   /// \param MBB a basic block which may be a loop preheader.
@@ -160,6 +160,13 @@ private:
   /// MBB is in \p ForceDrain, all InstCounters will be drained.
   Waitcnt getWaitsAtEnd(const State &S, const MachineBasicBlock &MBB,
                         const DenseSet<const MachineBasicBlock *> &ForceDrain);
+
+#ifndef NDEBUG
+  /// \returns true if nothing is in flight in \p S: every counter has an
+  /// empty timeline, a zero count and is not indeterminate. This must hold
+  /// right after the end wait of a block in ForceDrain.
+  bool isFullyDrained(const State &S) const;
+#endif
 
   /// Computes waits necessary before a certain point in a MBB.
   /// \param S the current State of a MBB.
@@ -262,9 +269,25 @@ private:
   /// \returns the waits forced right after \p MI (precise memory mode).
   Waitcnt getWaitsForcedAfter(const MachineInstr &MI) const;
 
-  /// \returns a wait of 0 on every counter, STORE_CNT only if
-  /// \p IncludeStores.
-  Waitcnt getAllZeroWaitcnt(bool IncludeStores) const;
+  /// Flags for \ref getAllZeroWaitcnt. By default, it waits for 0 on every
+  /// counter except STORE_CNT, X_CNT and ASYNC/TENSOR_CNT. These flags add
+  /// them back.
+  enum ZeroWaitFlags : unsigned {
+    ZW_Default = 0,
+    /// STORE_CNT (vscnt before gfx12).
+    ZW_StoreCnt = 1 << 0,
+    /// X_CNT (if applicable).
+    ZW_XCnt = 1 << 1,
+    /// ASYNC_CNT and TENSOR_CNT (if applicable).
+    ZW_AsyncAndTensorCnt = 1 << 2,
+    /// Every possible counter.
+    ZW_ForceAll = ZW_StoreCnt | ZW_XCnt | ZW_AsyncAndTensorCnt,
+  };
+
+  /// \returns a wait of 0 on every counter the pass resolves dependencies on
+  /// (except vscnt/STORE_CNT), including the expert counters in expert mode,
+  /// plus the counters added by \p Flags (see \ref ZeroWaitFlags).
+  Waitcnt getAllZeroWaitcnt(ZeroWaitFlags Flags = ZW_Default) const;
 
 #ifndef NDEBUG
   /// Asserts that the rewritten preceding waits of \p It wait for exactly \p W.
@@ -360,7 +383,7 @@ void AMDGPUNewInsertWaitcnts::solve(Solution &Sol) {
     // The last visit always wins, so preemptively clear the solution.
     Sol.forget(*MBB);
 
-    walkBlock(*MBB, OutStates, ForceDrain, &Sol);
+    walkBlock(*MBB, OutStates, ForceDrain, Sol);
     State &New = OutStates.at(MBB);
 
     if (IsRetreating) {
@@ -377,9 +400,6 @@ void AMDGPUNewInsertWaitcnts::solve(Solution &Sol) {
     }
 
     if (++Visits > TotalVisitBudget && !WillForceDrain) {
-      /// TODO: Move to a helper function? Maybe the entire solver should move
-      /// to a separate class?
-
       // We exhausted our budget on this function, do the conservatively correct
       // thing. This should really not fire often and it may be worth emitting a
       // diagnostic when it happens.
@@ -400,7 +420,7 @@ void AMDGPUNewInsertWaitcnts::solve(Solution &Sol) {
     for (MachineBasicBlock *Succ : MBB->successors()) {
       WL.push(Succ);
 
-      /// TODO: Implement this ?
+      /// TODO: Check if this is worthwhile before implementing.
       // Nested reset (A.7): a forward edge into a loop header restarts the
       // counters of that loop's retreating sources.
       //
@@ -447,24 +467,25 @@ bool AMDGPUNewInsertWaitcnts::shouldFlushPreheader(
   });
 }
 
+#ifndef NDEBUG
+bool AMDGPUNewInsertWaitcnts::isFullyDrained(const State &S) const {
+  return all_of(InstCounters, [&](const AMDGPUInstCounter &IC) {
+    InstCounterType T = IC.getType();
+    return S.ET.getTimeline(T).empty() && S.ET.count(T) == 0 &&
+           !S.ET.isIndeterminate(T);
+  });
+}
+#endif
+
 Waitcnt AMDGPUNewInsertWaitcnts::getWaitsAtEnd(
     const State &S, const MachineBasicBlock &MBB,
     const DenseSet<const MachineBasicBlock *> &ForceDrain) {
   Waitcnt W;
 
   if (ForceDrain.contains(&MBB)) {
-    // Do not use getAllZeroWaitcnt - this has to be more thorough: drain every
-    // single counter that has even just one event. This is necessary as
-    // ForceDrain is one of the guards that ensure we reach a fixpoint.
-    // An indeterminate counter can have an empty timeline (events we don't
-    // track), and a count without records must be drained too, or the
-    // out-state of this block would still depend on its in-state.
-    for (const AMDGPUInstCounter &IC : InstCounters) {
-      InstCounterType T = IC.getType();
-      if (!S.ET.getTimeline(T).empty() || S.ET.count(T) > 0 ||
-          S.ET.isIndeterminate(T))
-        W.set(T, 0);
-    }
+    // ForceDrain is one of the guards that ensure we reach a fixpoint: the
+    // out-state of this block must not depend on its in-state.
+    W = removeNoOpWaits(S, getAllZeroWaitcnt(ZW_ForceAll));
   }
 
   if (shouldFlushPreheader(S, MBB)) { // recomputed every visit (W7)
@@ -596,7 +617,7 @@ Waitcnt AMDGPUNewInsertWaitcnts::getAlwaysRequiredWaitsBefore(
   case AMDGPU::S_SETPC_B64_return:
     // Everything but stores must be resolved at return: the caller assumes so
     // after the call (see recordEvents).
-    W = getAllZeroWaitcnt(/*IncludeStores=*/false);
+    W = getAllZeroWaitcnt();
     break;
   case AMDGPU::S_SENDMSG:
   case AMDGPU::S_SENDMSGHALT:
@@ -610,7 +631,7 @@ Waitcnt AMDGPUNewInsertWaitcnts::getAlwaysRequiredWaitsBefore(
     // Without auto-waitcnt or back-off, the barrier must not have any memory
     // operation outstanding.
     if (!ST.hasAutoWaitcntBeforeBarrier() && !ST.hasBackOffBarrier())
-      W = getAllZeroWaitcnt(/*IncludeStores=*/true);
+      W = getAllZeroWaitcnt(ZW_StoreCnt);
     break;
   default:
     break;
@@ -964,7 +985,7 @@ void AMDGPUNewInsertWaitcnts::recordEvents(State &S, MachineInstr &MI) {
     // State-only drain, no wait emitted: the callee's entry S_WAITCNT 0 covers
     // every counter except STORE. The callee may leave stores in flight
     // (SIW:2758-2761).
-    applyWait(S, getAllZeroWaitcnt(/*IncludeStores=*/false));
+    applyWait(S, getAllZeroWaitcnt());
     setStateOnFunctionEntryOrReturn(S); // T6
     return;
   }
@@ -1000,12 +1021,14 @@ void AMDGPUNewInsertWaitcnts::setStateOnFunctionEntryOrReturn(State &S) {
 
 Waitcnt
 AMDGPUNewInsertWaitcnts::getWaitsForcedAfter(const MachineInstr &MI) const {
-  // SIW:2692-2700.
   Waitcnt W;
-  if (ST.isPreciseMemoryEnabled() && MI.mayLoadOrStore())
-    W = getAllZeroWaitcnt(MI.mayStore() && !SIInstrInfo::isAtomicRet(MI));
-  if (TII.isAlwaysGDS(MI.getOpcode()))
+  // When precise memory is used, do a waitcnt zero after every load/store.
+  if (ST.isPreciseMemoryEnabled() && MI.mayLoadOrStore()) {
+    bool IncludeStores = MI.mayStore() && !SIInstrInfo::isAtomicRet(MI);
+    W = getAllZeroWaitcnt(IncludeStores ? ZW_StoreCnt : ZW_Default);
+  } else if (TII.isAlwaysGDS(MI.getOpcode())) {
     W.set(DS_CNT, 0);
+  }
   return W;
 }
 
@@ -1014,19 +1037,21 @@ Waitcnt AMDGPUNewInsertWaitcnts::getEntryWait() const {
   // TODO(gfx12+): the old pass emits S_WAIT_LOADCNT_DSCNT 0 plus one wait per
   // extended counter, skipping STORE/X/ASYNC/TENSOR and counters the target
   // lacks, plus S_WAITCNT_DEPCTR in expert mode (SIW:3496-3522).
-  return getAllZeroWaitcnt(/*IncludeStores=*/false);
+  return getAllZeroWaitcnt();
 }
 
-Waitcnt AMDGPUNewInsertWaitcnts::getAllZeroWaitcnt(bool IncludeStores) const {
-  // Mirrors WaitcntGeneratorPreGFX12/GFX12Plus::getAllZeroWaitcnt in
-  // SIInsertWaitcnts.cpp. Counters not mentioned stay at ~0u (no wait).
-  if (!ST.hasExtendedWaitCounts())
-    return Waitcnt(0, 0, 0, IncludeStores && ST.hasVscnt() ? 0 : ~0u);
+Waitcnt AMDGPUNewInsertWaitcnts::getAllZeroWaitcnt(ZeroWaitFlags Flags) const {
+  const auto ZeroIf = [&](ZeroWaitFlags Flag) -> unsigned {
+    return (Flags & Flag) ? 0 : ~0u;
+  };
 
-  unsigned ExpertVal = IsExpertMode ? 0 : ~0u;
-  return Waitcnt(0, 0, 0, IncludeStores ? 0 : ~0u, 0, 0, 0, ~0u /* XCNT */,
-                 ~0u /* ASYNC_CNT */, ~0u /* TENSOR_CNT */, ExpertVal,
-                 ExpertVal, ExpertVal);
+  if (!ST.hasExtendedWaitCounts())
+    return Waitcnt(0, 0, 0, ST.hasVscnt() ? ZeroIf(ZW_StoreCnt) : ~0u);
+
+  const unsigned AsyncAndTensor = ZeroIf(ZW_AsyncAndTensorCnt);
+  const unsigned Expert = IsExpertMode ? 0 : ~0u;
+  return Waitcnt(0, 0, 0, ZeroIf(ZW_StoreCnt), 0, 0, 0, ZeroIf(ZW_XCnt),
+                 AsyncAndTensor, AsyncAndTensor, Expert, Expert, Expert);
 }
 
 void AMDGPUNewInsertWaitcnts::waitForAll(Waitcnt &W, const State &S,
@@ -1065,19 +1090,10 @@ void AMDGPUNewInsertWaitcnts::waitForMatchingRecords(
 bool AMDGPUNewInsertWaitcnts::flatForcesZero(const State &S,
                                              InstCounterType T) const {
   // A pending FLAT that may access both VMEM and LDS can decrement either
-  // counter early, so waits on LOAD_CNT and DS_CNT must go to 0 (SIW:1370).
+  // counter early, so waits on LOAD_CNT and DS_CNT must go to 0.
   if ((T != LOAD_CNT && T != DS_CNT) || ST.hasFlatLgkmVMemCountInOrder())
     return false;
 
-  // Deviation from the old pass, which records the LOAD/DS upper bounds at the
-  // time of the FLAT (setPendingFlat, SIW:615-617). With vscnt, a FLAT store
-  // has no LOAD_CNT event, so the old pass forces vmcnt(0) while an older,
-  // unrelated load is pending. Here only the FLAT's own records count. The
-  // FLAT always has a DS record (LDS_ACCESS), so it is still seen.
-  // [argument]: sound because the store's VMEM half does not touch vmcnt.
-  //
-  // TODO: Perf: scans up to two timelines per waitFor call. Compute once per
-  // instruction if it shows up in profiles (see roadmap R7).
   const auto IsPendingFlat = [&](const EventTrackerRecord &R) {
     return TII.mayAccessVMEMAndLDSThroughFlat(*R.getMI(), IsTgSplit);
   };
@@ -1104,7 +1120,7 @@ unsigned AMDGPUNewInsertWaitcnts::waitFor(const State &S, InstCounterType T,
 void AMDGPUNewInsertWaitcnts::walkBlock(
     MachineBasicBlock &MBB,
     DenseMap<const MachineBasicBlock *, State> &OutStates,
-    const DenseSet<const MachineBasicBlock *> &ForceDrain, Solution *Sol) {
+    const DenseSet<const MachineBasicBlock *> &ForceDrain, Solution &Sol) {
   State &S = OutStates.at(&MBB);
 
   S.ET.enterBlock(/*Getter=*/[&](auto &P) -> EventTracker & {
@@ -1116,8 +1132,7 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
   if (IsEntryWithWaits)
     setStateOnFunctionEntryOrReturn(S);
 
-  // Per-walk, intra-block state: starts "vccz may be stale" at every block
-  // entry, like the old pass (see VCCZRecomputeTracker).
+
   VCCZRecomputeTracker VCCZ(ST, TII);
 
   PrecedingWaits Preceding;
@@ -1125,10 +1140,7 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
 
   // The entry wait is folded into the first decision point: the first
   // instruction that is neither a wait nor a meta instruction, or the end of
-  // the block if there is none. This matches the old pass, which inserts
-  // S_WAITCNT 0 before the first non-meta instruction (SIW:3492-3494): any wait
-  // already there joins the same preceding waits. It is not simplified: it
-  // waits for the caller's unknown operations.
+  // the block if there is none.
   bool NeedsEntryWait = IsEntryWithWaits;
 
   for (MachineInstr &MI : MBB.instrs()) {
@@ -1137,43 +1149,53 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
       continue;
     }
 
-    if (isNonWaitcntMetaInst(MI)) {
+    if (isNonWaitcntMetaInst(MI))
       continue;
-    }
 
-    Waitcnt Extra = PWA.W; // D10: forced-after wait of the previous MI
+    // PWA contains the waits carried from the previous MI we visited. Think of
+    // it as a "wait-after", but instead of adding a new DenseMap in the
+    // Solution for that, we just carry it and add it to the "wait-before" of
+    // the next instruction (or the block end wait).
+    Waitcnt Extra = PWA.W;
     if (NeedsEntryWait) {
       Extra = Extra.combined(getEntryWait());
       NeedsEntryWait = false;
     }
 
-    if (MI.getIterator() == MBB.getFirstTerminator()) {
+    // If we are reaching the MBB's terminator, check if any waits are necessary
+    // at the end of this MBB (e.g. force drain).
+    if (MI.getIterator() == MBB.getFirstTerminator())
       Extra = Extra.combined(getWaitsAtEnd(S, MBB, ForceDrain));
-    }
 
-    if (Sol && isEndPgm(MI))
-      (*Sol)[MBB].EndPgmSafeToMessage[&MI] = isSafeToDeallocVGPRs(S, PWA.W);
+    // Handle VGPR deallocation before S_ENDPGM.
+    if (isEndPgm(MI))
+      Sol[MBB].EndPgmSafeToMessage[&MI] = isSafeToDeallocVGPRs(S, PWA.W);
 
+    // Check the instruction dependencies and add necessary waitcnts
+    // before it.
     Waitcnt W = getWaitsBefore(S, &MI, Preceding, Extra);
     applyWait(S, W);
-    if (Sol) {
-      (*Sol)[MBB].Before[&MI] = W;
-      // SIW:2702-2710: S_NOP between the forced wait after an always-GDS
-      // instruction and S_ENDPGM.
-      if (PWA.AlwaysGDS && PWA.W.hasWait() &&
-          isNextNonMetaEndpgm(MBB, MI.getIterator()))
-        (*Sol)[MBB].NopAfterWait.insert(&MI);
-    }
+    Sol[MBB].Before[&MI] = W;
 
+    // A forced drain must leave nothing in flight, e.g. if getAllZeroWaitcnt
+    // misses a counter. Checked before the terminator records its own events.
+    assert((MI.getIterator() != MBB.getFirstTerminator() ||
+            !ForceDrain.contains(&MBB) || isFullyDrained(S)) &&
+           "forced drain left events in flight");
+
+    // Need S_NOP between the forced wait after an always-GDS instruction and
+    // S_ENDPGM.
+    if (PWA.AlwaysGDS && PWA.W.hasWait() &&
+        isNextNonMetaEndpgm(MBB, MI.getIterator()))
+      Sol[MBB].NopAfterWait.insert(&MI);
+
+    // Once we are done checking what needs to be waited on before the
+    // instruction, record the instruction itself.
     recordEvents(S, MI);
 
-    // Must come after recordEvents and applyWait: the old pass looks at the
-    // state after MI was processed (and after its wait, which for a
-    // vccz-reading branch drains the pending SMEM on bugged targets). Tracked
-    // on every visit, but only recorded (like the waits) when building the
-    // solution.
-    if (VCCZ.visit(MI, hasPendingSMEM(S)) && Sol)
-      (*Sol)[MBB].RecomputeVCCZBefore.insert(&MI);
+    // Checking for VCCZ-related workaround must be done at the very end.
+    if (VCCZ.visit(MI, hasPendingSMEM(S)))
+      Sol[MBB].RecomputeVCCZBefore.insert(&MI);
 
     Preceding = {};
     PWA = {removeNoOpWaits(S, getWaitsForcedAfter(MI)),
@@ -1181,24 +1203,27 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
 
     // TODO: May want to verify less often once the pass is stable?
 #if !defined(NDEBUG) || defined(EXPENSIVE_CHECKS)
-    // S.ET.verify();
+    if (Opts.Verify)
+      S.ET.verify();
 #endif
   }
 
+  // This handles MBBs without terminators (fall-through).
   if (MBB.getFirstTerminator() == MBB.end()) { // fallthrough block
     Waitcnt Extra = PWA.W.combined(getWaitsAtEnd(S, MBB, ForceDrain));
+
     if (NeedsEntryWait) // entry block with only waits and meta instructions
       Extra = Extra.combined(getEntryWait());
+
     Waitcnt W = getWaitsBefore(S, /*MI=*/nullptr, Preceding, Extra);
     applyWait(S, W);
-    if (Sol) {
-      (*Sol)[MBB].AtEnd = W;
-      (*Sol)[MBB].NopAfterAtEnd = PWA.AlwaysGDS && PWA.W.hasWait() &&
-                                  isNextNonMetaEndpgm(MBB, MBB.instr_end());
-    }
-  }
+    assert((!ForceDrain.contains(&MBB) || isFullyDrained(S)) &&
+           "forced drain left events in flight");
 
-  // assert(C.W == Waitcnt() && "forced-after wait on a terminator");
+    Sol[MBB].AtEnd = W;
+    Sol[MBB].NopAfterAtEnd = PWA.AlwaysGDS && PWA.W.hasWait() &&
+                             isNextNonMetaEndpgm(MBB, MBB.instr_end());
+  }
 }
 
 bool AMDGPUNewInsertWaitcnts::isSafeToDeallocVGPRs(
@@ -1279,6 +1304,10 @@ bool AMDGPUNewInsertWaitcnts::apply(const Solution &Sol) {
     if (BS->AtEnd)
       Rewrite(MBB, MBB.instr_end(), *BS->AtEnd, BS->NopAfterAtEnd);
   }
+
+  Modified |= insertScalarStoreCacheFlushes(MF, ST, TII);
+  Modified |= insertVGPRDeallocs(Sol);
+
   return Modified;
 }
 
@@ -1338,11 +1367,6 @@ bool AMDGPUNewInsertWaitcnts::run() {
 
   solve(Sol);
   bool Modified = apply(Sol);
-
-  // TODO: move to apply
-  Modified |= insertScalarStoreCacheFlushes(MF, ST, TII);
-  Modified |= insertVGPRDeallocs(Sol);
-
   if (Opts.Verify)
     verify();
 
