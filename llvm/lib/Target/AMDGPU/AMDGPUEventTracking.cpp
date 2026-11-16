@@ -40,8 +40,8 @@ void EventTrackerRecord::print(raw_ostream &OS, bool PrintMI,
     OS << "MI@" << (void *)MI << '\n';
 }
 
-hash_code EventTrackerRecord::getIdentity() const {
-  return hash_combine((void *)MI, Kind.rawValue());
+EventTrackerRecord::IdentityTy EventTrackerRecord::getIdentity() const {
+  return {MI, Kind.rawValue()};
 }
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
@@ -194,7 +194,8 @@ void EventTracker::markIndeterminate(InstCounterType T) {
   if (!CD.IC)
     return;
 
-  LLVM_DEBUG(dbgs() << "[EventTracker] Marking as indeterminate: " << CD.IC->getName() << "\n");
+  LLVM_DEBUG(dbgs() << "[EventTracker] Marking as indeterminate: "
+                    << CD.IC->getName() << "\n");
   CD.IsIndeterminate = true;
   widenCount(T);
 }
@@ -274,7 +275,7 @@ void EventTracker::verify() const {
     //    same age. `recordIncomings` merges based on identity, and `record`
     //    increments the age of all pre-existing records before inserting a
     //    new one.
-    DenseSet<std::pair<hash_code, unsigned>> RecIdentityCheck;
+    DenseSet<std::pair<EventTrackerRecord::IdentityTy, unsigned>> RecIdentityCheck;
     for (const EventTrackerRecord &E : C.Timeline) {
       if (E.getAge() > C.Count && !isCapped(C)) {
         OnError();
@@ -411,7 +412,7 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
     if (!CData.IC)
       continue;
 
-    DenseMap<hash_code, EventTrackerRecord> Acc;
+    DenseMap<EventTrackerRecord::IdentityTy, unsigned> Acc;
 
     for (EventTracker *Pred : Preds) {
       auto &PredCData = Pred->Counters[CData.IC->getType()];
@@ -425,17 +426,17 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
         // At a join, collapse records from all predecessors with the same
         // identity (MI+Kind) into a single record whose age is the minimum
         // across predecessors.
-        auto [It, Inserted] =
-            Acc.try_emplace(PredEntry.getIdentity(), PredEntry);
+        auto [It, Inserted] = Acc.try_emplace(
+            PredEntry.getIdentity(), PredEntry.getAge());
         if (!Inserted) {
           auto &AccVal = It->second;
-          AccVal.setAge(std::min(AccVal.getAge(), PredEntry.getAge()));
+          AccVal = std::min(AccVal, PredEntry.getAge());
         }
       }
     }
 
-    auto AccVals = Acc.values();
-    CData.Timeline.append(AccVals.begin(), AccVals.end());
+    for (auto &[RecIdent, RecAge]: Acc)
+      CData.Timeline.emplace_back(RecIdent, RecAge);
 
     CData.PendingEventsCache = calcPendingEvents(CData);
 

@@ -170,6 +170,10 @@ class SingleHWEvent {
 public:
   using value_type = uint8_t;
 
+  static constexpr SingleHWEvent fromRaw(value_type Val) {
+    return SingleHWEvent(Val);
+  }
+
   static constexpr SingleHWEvent encode(HWEvents E) {
     assert(E.size() == 1 && "expected exactly one event!");
     return SingleHWEvent(countr_zero_constexpr(E.value()));

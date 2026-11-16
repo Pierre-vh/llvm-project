@@ -82,6 +82,12 @@ class EventTracker;
 /// sufficient to guarantee that R has completed (and its results can be used).
 class EventTrackerRecord {
 public:
+  using IdentityTy = std::pair<MachineInstr *, SingleHWEvent::value_type>;
+
+  EventTrackerRecord(IdentityTy Ident, uint32_t Age = 0)
+      : EventTrackerRecord(Ident.first, SingleHWEvent::fromRaw(Ident.second),
+                           Age) {}
+
   EventTrackerRecord(MachineInstr *MI, SingleHWEvent Kind, uint32_t Age = 0)
       : MI(MI), Kind(Kind) {
     setAge(Age);
@@ -102,9 +108,9 @@ public:
   LLVM_DUMP_METHOD void dump() const;
 #endif
 
-  /// \returns the "identity" of this record, which is a hash of its kind and
-  /// MI.
-  hash_code getIdentity() const;
+  /// \returns the "identity" of this record, which is a pair of its MI and HW
+  /// Event Kind.
+  IdentityTy getIdentity() const;
 
   bool operator==(const EventTrackerRecord &Other) const {
     return MI == Other.MI && Kind == Other.Kind && Age == Other.Age;
