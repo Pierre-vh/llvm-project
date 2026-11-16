@@ -102,10 +102,11 @@ struct DependencyQuery {
   bool MayDependOnSMEMLoad = false;
 
   bool hasRegChecks() const { return ChecksSCC || !RegUnits.empty(); }
+  bool hasMemChecks() const { return MayDependOnLDSDMA || MayDependOnSMEMLoad; }
 
   /// \returns false if no record of the counter can match.
   bool canMatch() const {
-    return hasRegChecks() || MayDependOnLDSDMA || MayDependOnSMEMLoad;
+    return hasRegChecks() || hasMemChecks();
   }
 
   /// \returns true if \p Reg overlaps a checked register, with the rules of

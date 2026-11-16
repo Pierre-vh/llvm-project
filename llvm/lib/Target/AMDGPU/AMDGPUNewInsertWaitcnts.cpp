@@ -532,15 +532,20 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsRequiredBy(const State &S,
                                                     const MachineInstr &MI) {
   Waitcnt W;
 
-  // Calls: the callee's entry waits for everything, so only the callee address
-  // and the saved return address wait, and only on SMEM (SIW:2414-2428).
+  assert(SmemCounter && "no counter tracks SMEM");
+  InstCounterType SmemT = SmemCounter->getType();
+
+  // Calls: the callee's entry waits for everything for us, so we only need to
+  // wait on a SMEM write if it touches the call addr or dst.
   if (MI.isCall()) {
-    assert(SmemCounter && "no counter tracks SMEM");
-    waitForMatchingRecords(
-        W, S, SmemCounter->getType(), /*DrainAll=*/false, [&](const auto &R) {
-          return HWEvents(R.getKind()) == HWEvents::SMEM_ACCESS &&
-                 writesCallAddrOrDst(*R.getMI(), MI);
-        });
+    // Don't scan the TL if we don't even have a SMEM_ACCESS.
+    if (S.ET.getPendingEvents(SmemT) & HWEvents::SMEM_ACCESS) {
+      auto Pred = [&](const auto &R) {
+        return HWEvents(R.getKind()) == HWEvents::SMEM_ACCESS &&
+               writesCallAddrOrDst(*R.getMI(), MI);
+      };
+      waitForMatchingRecords(W, S, SmemT, /*DrainAll=*/false, Pred);
+    }
     return W;
   }
 
@@ -555,10 +560,10 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsRequiredBy(const State &S,
     if (!Q.canMatch())
       continue;
 
-    waitForMatchingRecords(W, S, T, /*DrainAll=*/false,
-                           [&](const EventTrackerRecord &R) {
-                             return hasDependencyOn(Q, MI, R, IC);
-                           });
+    auto Pred = [&](const EventTrackerRecord &R) {
+      return hasDependencyOn(Q, MI, R, IC);
+    };
+    waitForMatchingRecords(W, S, T, /*DrainAll=*/false, Pred);
   }
 
   // Counters that must be empty before MI. The old pass simplifies these like
@@ -569,35 +574,40 @@ Waitcnt AMDGPUNewInsertWaitcnts::getWaitsRequiredBy(const State &S,
     Empty = removeVmemInvOnlyWait(S, Empty);
   W = W.combined(Empty);
 
-  // EXEC write: drain exports and GDS source locks (SIW:2395-2404).
+  // On EXEC write, we must drain pending exports and resource locks.
   if (MI.modifiesRegister(AMDGPU::EXEC, &TRI)) {
     static constexpr HWEvents ExpCntDrainEvents =
         HWEvents::EXP_GPR_LOCK | HWEvents::EXP_PARAM_ACCESS |
         HWEvents::EXP_POS_ACCESS | HWEvents::GDS_GPR_LOCK;
-    waitForMatchingRecords(W, S, EXP_CNT, /*DrainAll=*/true, [](const auto &R) {
-      return (HWEvents(R.getKind()) & ExpCntDrainEvents).any();
-    });
+    HWEvents ExpPendingEvents = S.ET.getPendingEvents(EXP_CNT);
+    if (ExpPendingEvents & ExpCntDrainEvents)
+      W.add(EXP_CNT, 0);
   }
 
-  // Always-GDS: wait for a pending GDS operation (SIW:2408-2409, LastGDS is
-  // set for DS producers that are always-GDS or have the gds bit, SIW:2722).
+  // Always-GDS: wait for a pending GDS operation.
   if (TII.isAlwaysGDS(MI.getOpcode())) {
-    waitForMatchingRecords(
-        W, S, DS_CNT, /*DrainAll=*/false, [&](const auto &R) {
-          const MachineInstr &P = *R.getMI();
-          return SIInstrInfo::isDS(P) &&
-                 (TII.isAlwaysGDS(P.getOpcode()) ||
-                  TII.hasModifiersSet(P, AMDGPU::OpName::gds));
-        });
+    // Instructions that are isAlwaysGDS or have the gds modifier set will
+    // always have one of these events set:
+    static constexpr HWEvents GDSInstEvents =
+        HWEvents::GDS_ACCESS | HWEvents::GDS_GPR_LOCK;
+    HWEvents DsPendingEvents = S.ET.getPendingEvents(DS_CNT);
+    if (DsPendingEvents & GDSInstEvents) {
+      auto Pred = [&](const auto &R) {
+        return SIInstrInfo::isDS(*R.getMI()) &&
+               GDSInstEvents.contains(R.getKind());
+      };
+      waitForMatchingRecords(W, S, DS_CNT, /*DrainAll=*/false, Pred);
+    }
   }
 
-  // VCCZ bug: a VCCZ-reading branch waits for pending SMEM (SIW:2578-2581).
+  // VCCZ bug: a VCCZ-reading branch needs to wait for pending SMEM.
   if (SIInstrInfo::isCBranchVCCZRead(MI) && ST.hasReadVCCZBug()) {
-    assert(SmemCounter && "no counter tracks SMEM");
-    waitForMatchingRecords(
-        W, S, SmemCounter->getType(), /*DrainAll=*/false, [](const auto &R) {
-          return HWEvents(R.getKind()) == HWEvents::SMEM_ACCESS;
-        });
+    HWEvents SmemPendingEvents = S.ET.getPendingEvents(SmemT);
+    // SMEM is always out of order, so just insert the right wait directly.
+    if (SmemPendingEvents & HWEvents::SMEM_ACCESS) {
+      assert(willNeedWaitZero(S, SmemT));
+      W.add(SmemT, 0);
+    }
   }
 
   return W;
@@ -721,10 +731,6 @@ bool AMDGPUNewInsertWaitcnts::hasRegDependencyOn(const DependencyQuery &Q,
   if (!Q.hasRegChecks())
     return false;
 
-  // Registers of P that MI must wait on T for (defs, or EXP_CNT locks).
-  //
-  // TODO(perf): this only depends on (P, T) and the MIR is read-only during
-  // the solve, so it could be cached.
   SmallVector<const MachineOperand *, 4> Tracked;
   getOperandsTrackedByCounter(TII, TRI, MRI, P, T, Tracked);
   return any_of(Tracked, [&](const MachineOperand *TrackedOp) {
@@ -849,6 +855,9 @@ bool AMDGPUNewInsertWaitcnts::hasPendingWriteTo(const State &S, MCRegister Reg,
 bool AMDGPUNewInsertWaitcnts::hasMemDependencyOn(const DependencyQuery &Q,
                                                  const MachineInstr &MI,
                                                  const MachineInstr &P) const {
+  if (!Q.hasMemChecks())
+    return false;
+
   // LDS DMA → LDS access (SIW:2437-2463). Back-to-back LDS DMAs don't wait
   // for each other.
   //
@@ -1114,7 +1123,7 @@ bool AMDGPUNewInsertWaitcnts::flatForcesZero(const State &S,
 
   if (PerInstCache && PerInstCache->HasPendingFlat) {
 #ifdef EXPENSIVE_CHECKS
-    assert(*PerInstCache->HasPendingFlat =
+    assert(*PerInstCache->HasPendingFlat ==
                hasPendingFlat(S.ET, TII, IsTgSplit));
 #endif
     return *PerInstCache->HasPendingFlat;
@@ -1285,11 +1294,9 @@ bool AMDGPUNewInsertWaitcnts::isSafeToDeallocVGPRs(
   if (S.ET.isIndeterminate(STORE_CNT))
     return false;
 
-  const auto &Timeline = S.ET.getTimeline(STORE_CNT);
-  bool HasStores = S.ET.count(STORE_CNT) > 0 || !Timeline.empty();
-  bool HasScratchStore = any_of(Timeline, [](const EventTrackerRecord &R) {
-    return HWEvents(R.getKind()) == HWEvents::SCRATCH_WRITE_ACCESS;
-  });
+  HWEvents PendingStores = S.ET.getPendingEvents(STORE_CNT);
+  bool HasStores = S.ET.count(STORE_CNT) > 0;
+  bool HasScratchStore = (PendingStores & HWEvents::SCRATCH_WRITE_ACCESS).any();
   return HasStores && !HasScratchStore;
 }
 
