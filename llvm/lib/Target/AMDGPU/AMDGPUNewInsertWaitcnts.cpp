@@ -32,6 +32,7 @@
 #include "llvm/CodeGen/MachinePostDominators.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Target/TargetMachine.h"
+#include <optional>
 
 using namespace llvm;
 using namespace llvm::AMDGPU;
@@ -77,6 +78,12 @@ struct State {
   //    Can EventTracker do it?
 
   bool operator==(const State &Other) const { return ET == Other.ET; }
+};
+
+/// Per-instruction cache of information to avoid expensive recomputations
+/// whenever we analyze a record. This is cleared whenever the timeline changes.
+struct PerInstructionCache {
+  std::optional<bool> HasPendingFlat;
 };
 
 class AMDGPUNewInsertWaitcnts {
@@ -339,6 +346,7 @@ private:
   WaitcntRPOInfo RPO;
   PassOptions Opts;
   WaitcntLoopPreheaderInfo LoopPreInfo;
+  mutable std::optional<PerInstructionCache> PerInstCache;
 
   bool EntryBlocksNeedWaits = false;
   bool OptNone = false;
@@ -976,7 +984,6 @@ void AMDGPUNewInsertWaitcnts::applyWait(State &S, const Waitcnt &W) {
       continue;
     S.ET.drain(T, Val);
   }
-
   // TODO: ASYNCMARK state update (App. B).
 }
 
@@ -1087,6 +1094,17 @@ void AMDGPUNewInsertWaitcnts::waitForMatchingRecords(
   }
 }
 
+static bool hasPendingFlat(const EventTracker &ET, const SIInstrInfo &TII,
+                           bool IsTgSplit) {
+  const auto IsPendingFlat = [&](const EventTrackerRecord &R) {
+    // FIXME?: We could gain some precision by not checking records that will be
+    // drained by the current waitcnt (if we had access to that).
+    return TII.mayAccessVMEMAndLDSThroughFlat(*R.getMI(), IsTgSplit);
+  };
+  return any_of(ET.getTimeline(DS_CNT), IsPendingFlat) ||
+         any_of(ET.getTimeline(LOAD_CNT), IsPendingFlat);
+}
+
 bool AMDGPUNewInsertWaitcnts::flatForcesZero(const State &S,
                                              InstCounterType T) const {
   // A pending FLAT that may access both VMEM and LDS can decrement either
@@ -1094,11 +1112,18 @@ bool AMDGPUNewInsertWaitcnts::flatForcesZero(const State &S,
   if ((T != LOAD_CNT && T != DS_CNT) || ST.hasFlatLgkmVMemCountInOrder())
     return false;
 
-  const auto IsPendingFlat = [&](const EventTrackerRecord &R) {
-    return TII.mayAccessVMEMAndLDSThroughFlat(*R.getMI(), IsTgSplit);
-  };
-  return any_of(S.ET.getTimeline(DS_CNT), IsPendingFlat) ||
-         any_of(S.ET.getTimeline(LOAD_CNT), IsPendingFlat);
+  if (PerInstCache && PerInstCache->HasPendingFlat) {
+#ifdef EXPENSIVE_CHECKS
+    assert(*PerInstCache->HasPendingFlat =
+               hasPendingFlat(S.ET, TII, IsTgSplit));
+#endif
+    return *PerInstCache->HasPendingFlat;
+  }
+  bool Res = hasPendingFlat(S.ET, TII, IsTgSplit);
+
+  if (PerInstCache)
+    PerInstCache->HasPendingFlat = Res;
+  return Res;
 }
 
 bool AMDGPUNewInsertWaitcnts::willNeedWaitZero(const State &S,
@@ -1132,7 +1157,6 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
   if (IsEntryWithWaits)
     setStateOnFunctionEntryOrReturn(S);
 
-
   VCCZRecomputeTracker VCCZ(ST, TII);
 
   PrecedingWaits Preceding;
@@ -1151,6 +1175,10 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
 
     if (isNonWaitcntMetaInst(MI))
       continue;
+
+    // The first part of the loop computes dependencies without changing the TL.
+    // Enable the per-inst cache.
+    PerInstCache.emplace();
 
     // PWA contains the waits carried from the previous MI we visited. Think of
     // it as a "wait-after", but instead of adding a new DenseMap in the
@@ -1174,6 +1202,11 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
     // Check the instruction dependencies and add necessary waitcnts
     // before it.
     Waitcnt W = getWaitsBefore(S, &MI, Preceding, Extra);
+
+    // From here on now, we'll change the TL by applying waits and adding new
+    // events. Disable the PerInstCache so it cannot go stale.
+    PerInstCache.reset();
+
     applyWait(S, W);
     Sol[MBB].Before[&MI] = W;
 
