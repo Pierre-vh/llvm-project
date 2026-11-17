@@ -32,8 +32,8 @@ namespace AMDGPU {
 
 void EventTrackerRecord::print(raw_ostream &OS, bool PrintMI,
                                unsigned Indent) const {
-  OS.indent(Indent) << "Record Kind=" << getKind() << " Age=" << getAge()
-                    << ": ";
+  OS.indent(Indent) << "Record Kind=" << getKind()
+                    << " WaitValue=" << getWaitValue() << ": ";
   if (PrintMI && getMI())
     OS << *getMI();
   else
@@ -103,10 +103,11 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
 
     // NB: There is an intentional tradeoff here. We could avoid this loop by
     // instead storing a timestamp in each record, and having a monotonically
-    // increasing clock to infer the age (clock - timestamp = age).
+    // increasing clock to infer the wait value (clock - timestamp).
     // However, it would:
-    //  - Complicate fetching the age (`EventTrackerRecord` could no longer
-    //    answer it on its own, and we would need a separate query/wrapper).
+    //  - Complicate fetching the wait value (`EventTrackerRecord` could no
+    //    longer answer it on its own, and we would need a separate
+    //    query/wrapper).
     //  - Make merging incoming records more annoying (we would need to rebase
     //    the clock).
     //  - Potentially require (much) more space in EventTrackerRecord to store
@@ -115,7 +116,7 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
     // All in all, this small loop is fine for now, but we can revisit it if
     // profiling data justifies the change.
     for (RecordImpl &Live : CD.Timeline)
-      ++Live.Age;
+      ++Live.MaxWaitToComplete;
 
     // NOTE: Unlike recordIncomings, we do not merge with a previous record that
     // has the same identity (MI+Kind). Having two such records is fine: one is
@@ -163,7 +164,7 @@ void EventTracker::drain(InstCounterType T, unsigned N) {
     CD.Count = std::min(CD.Count, N);
 
     auto *RmIt = remove_if(CD.Timeline, [&](RecordImpl &R) {
-      if (R.Age < N)
+      if (R.MaxWaitToComplete < N)
         return false;
       LLVM_DEBUG(dbgs() << "  | Removing ";
                  EventTrackerRecord(R).print(dbgs()));
@@ -211,8 +212,8 @@ bool EventTracker::isTimelineIdentical(InstCounterType T,
 bool EventTracker::operator==(const EventTracker &Other) const {
   assert(Counters.size() == Other.Counters.size());
   // Timelines are kept sorted by compareRecords, which is a strict total order
-  // on the records of a timeline (verify() rejects duplicate identities at the
-  // same age), so an element-wise compare is exact.
+  // on the records of a timeline (verify() rejects duplicate identities with
+  // the same wait value), so an element-wise compare is exact.
   for (const auto &[A, B] : zip_equal(Counters, Other.Counters)) {
     assert(A.IC == B.IC && "comparing trackers with different counters");
     if (A.Count != B.Count || A.Timeline != B.Timeline ||
@@ -240,7 +241,7 @@ void EventTracker::drainCappedRecords(InstCounterType T) {
   unsigned NumAboveCap = 0;
   unsigned Cap = CD.IC->getLimit() - 1;
   for (const RecordImpl &R : CD.Timeline) {
-    if (R.Age >= Cap)
+    if (R.MaxWaitToComplete >= Cap)
       ++NumAboveCap;
     else
       break;
@@ -273,30 +274,32 @@ void EventTracker::verify() const {
     };
 
     // Check some basic invariants:
-    //  - The age of a record cannot exceed the value of the counter.
-    //  - We cannot have two records with the same identity at the same age,
-    //    e.g. two VMEM_READ_ACCESS records for the same instruction at the
-    //    same age. `recordIncomings` merges based on identity, and `record`
-    //    increments the age of all pre-existing records before inserting a
-    //    new one.
+    //  - The wait value of a record cannot exceed the value of the counter.
+    //  - We cannot have two records with the same identity and the same wait
+    //    value, e.g. two VMEM_READ_ACCESS records for the same instruction
+    //    with the same wait value. `recordIncomings` merges based on identity,
+    //    and `record` increments the wait value of all pre-existing records
+    //    before inserting a new one.
     DenseSet<std::pair<RecordIdentity, unsigned>> RecIdentityCheck;
     for (const RecordImpl &CR : C.Timeline) {
       EventTrackerRecord ETR(CR);
-      if (CR.Age > C.Count && !isCapped(C)) {
+      if (CR.MaxWaitToComplete > C.Count && !isCapped(C)) {
         OnError();
         dbgs() << "Concerning Record:";
         ETR.print(dbgs());
-        llvm_unreachable("record age is out of range");
+        llvm_unreachable("record wait value is out of range");
       }
 
       RecordIdentity CRIdent = {CR.MI, CR.Kind};
-      auto [It, Inserted] = RecIdentityCheck.insert({CRIdent, ETR.getAge()});
+      auto [It, Inserted] =
+          RecIdentityCheck.insert({CRIdent, ETR.getWaitValue()});
       if (!Inserted) {
         OnError();
         dbgs() << "Concerning Record:";
         ETR.print(dbgs());
         llvm_unreachable("The timeline cannot have two records with the same "
-                         "MachineInstr, Kind and Age at the same time!");
+                         "MachineInstr, Kind and wait value at the same "
+                         "time!");
       }
     }
 
@@ -366,11 +369,11 @@ bool EventTracker::isCapped(const CounterData &CD) const {
 }
 
 bool EventTracker::compareRecords(const RecordImpl &A, const RecordImpl &B) {
-  // Different age.
-  if (A.Age != B.Age)
-    return A.Age > B.Age;
+  // Different wait value.
+  if (A.MaxWaitToComplete != B.MaxWaitToComplete)
+    return A.MaxWaitToComplete > B.MaxWaitToComplete;
 
-  // Same age but different kind.
+  // Same wait value but different kind.
   unsigned AKindV = A.Kind.rawValue();
   unsigned BKindV = B.Kind.rawValue();
   if (AKindV != BKindV)
@@ -381,15 +384,15 @@ bool EventTracker::compareRecords(const RecordImpl &A, const RecordImpl &B) {
   if (AMI == BMI)
     return false;
 
-  // Same age/kind but MIs are in different MBBs: the one in the MBB with the
-  // lower number comes first.
+  // Same wait value/kind but MIs are in different MBBs: the one in the MBB with
+  // the lower number comes first.
   const MachineBasicBlock *Bbb = BMI->getParent();
   const MachineBasicBlock *Abb = AMI->getParent();
   if (Abb != Bbb)
     return Abb->getNumber() < Bbb->getNumber();
 
   llvm_unreachable("We cannot have two distinct instructions from the same "
-                   "MBB, at the same age and with the same event kind!");
+                   "MBB, with the same wait value and the same event kind!");
 }
 
 void EventTracker::clear() {
@@ -428,23 +431,24 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
 
       for (const RecordImpl &PredEntry : PredCData.Timeline) {
         // At a join, collapse records from all predecessors with the same
-        // identity (MI+Kind) into a single record whose age is the minimum
-        // across predecessors.
+        // identity (MI+Kind) into a single record whose wait value is the
+        // minimum across predecessors (i.e. the most conservative one).
         RecordIdentity Key = {PredEntry.MI, PredEntry.Kind};
-        auto [It, Inserted] = Acc.try_emplace(Key, PredEntry.Age);
+        auto [It, Inserted] =
+            Acc.try_emplace(Key, PredEntry.MaxWaitToComplete);
         if (!Inserted) {
           auto &AccVal = It->second;
-          AccVal = std::min(AccVal, PredEntry.Age);
+          AccVal = std::min(AccVal, PredEntry.MaxWaitToComplete);
         }
       }
     }
 
-    for (auto &[RecIdent, RecAge] : Acc)
-      CData.Timeline.emplace_back(*RecIdent.first, RecIdent.second, RecAge);
+    for (auto &[RecIdent, RecWait] : Acc)
+      CData.Timeline.emplace_back(*RecIdent.first, RecIdent.second, RecWait);
 
     CData.PendingEventsCache = calcPendingEvents(CData);
 
-    // Sort records by descending age for consistent iteration.
+    // Sort records by descending wait value for consistent iteration.
     stable_sort(CData.Timeline, compareRecords);
   }
 

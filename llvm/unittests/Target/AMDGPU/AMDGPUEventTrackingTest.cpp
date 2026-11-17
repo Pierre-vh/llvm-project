@@ -74,14 +74,14 @@ public:
 struct RecordSnapshot {
   MachineInstr *MI;
   SingleHWEvent Kind;
-  unsigned Age;
+  unsigned WaitValue;
 };
 
 /// Expected state of one timeline record, for
 /// \ref TrackerRecordsChecker::hasRecords.
 struct ExpectedRecord {
   unsigned Opcode;
-  unsigned Age;
+  unsigned WaitValue;
   /// If set, the parent block of the record's MachineInstr.
   const MachineBasicBlock *Parent = nullptr;
 };
@@ -97,7 +97,7 @@ public:
   TrackerRecordsChecker(const EventTracker &ET, InstCounterType T)
       : Count(ET.count(T)) {
     for (EventTrackerRecord R : ET.getTimeline(T))
-      Records.push_back({R.getMI(), R.getKind(), R.getAge()});
+      Records.push_back({R.getMI(), R.getKind(), R.getWaitValue()});
   }
 
   unsigned getCount() const { return Count; }
@@ -122,31 +122,34 @@ public:
           << Records.size() << ':';
       for (const RecordSnapshot &R : Records)
         Res << ' '
-            << describe(R.MI, R.MI->getOpcode(), R.Age, R.MI->getParent());
+            << describe(R.MI, R.MI->getOpcode(), R.WaitValue,
+                        R.MI->getParent());
       return Res;
     }
 
     for (auto [Idx, R, E] : enumerate(Records, Expected)) {
-      if (R.MI->getOpcode() == E.Opcode && R.Age == E.Age &&
+      if (R.MI->getOpcode() == E.Opcode && R.WaitValue == E.WaitValue &&
           (!E.Parent || R.MI->getParent() == E.Parent))
         continue;
       return testing::AssertionFailure()
              << "record #" << Idx << ": expected "
-             << describe(R.MI, E.Opcode, E.Age, E.Parent) << ", got "
-             << describe(R.MI, R.MI->getOpcode(), R.Age, R.MI->getParent());
+             << describe(R.MI, E.Opcode, E.WaitValue, E.Parent) << ", got "
+             << describe(R.MI, R.MI->getOpcode(), R.WaitValue,
+                         R.MI->getParent());
     }
     return testing::AssertionSuccess();
   }
 
 private:
-  /// \returns "{OPCODE, age N[, bb.M]}". \p MI is only used to fetch the
+  /// \returns "{OPCODE, wait N[, bb.M]}". \p MI is only used to fetch the
   /// opcode names.
   static std::string describe(const MachineInstr *MI, unsigned Opcode,
-                              unsigned Age, const MachineBasicBlock *Parent) {
+                              unsigned WaitValue,
+                              const MachineBasicBlock *Parent) {
     const TargetInstrInfo *TII = MI->getMF()->getSubtarget().getInstrInfo();
     std::string Str;
     raw_string_ostream OS(Str);
-    OS << '{' << TII->getName(Opcode) << ", age " << Age;
+    OS << '{' << TII->getName(Opcode) << ", wait " << WaitValue;
     if (Parent)
       OS << ", bb." << Parent->getNumber();
     OS << '}';
@@ -229,7 +232,7 @@ body:             |
   {
     auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
     EXPECT_EQ(StoreCnt.getCount(), 2u);
-    // Drain doesn't change record ages.
+    // Drain doesn't change record wait values.
     EXPECT_TRUE(StoreCnt.hasRecords({
         {AMDGPU::GLOBAL_STORE_DWORDX2, 1},
         {AMDGPU::GLOBAL_STORE_DWORD, 0},
@@ -455,7 +458,7 @@ body:             |
   auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
   // Count is 1 because we have 1 event max across all predecessors.
   EXPECT_EQ(StoreCnt.getCount(), 1u);
-  // Each predecessor contributes its store at age 0.
+  // Each predecessor contributes its store with a wait value of 0.
   EXPECT_TRUE(StoreCnt.hasRecords({
       {AMDGPU::GLOBAL_STORE_DWORD, 0},   // From bb.0.
       {AMDGPU::GLOBAL_STORE_DWORDX2, 0}, // From bb.1.
@@ -526,9 +529,9 @@ body:             |
 ///   - bb2 adds a store and waits on the two stores from bb0 afterwards
 ///
 /// The timeline will be:
-///   - Stores from bb0 exist at 1/2
-///   - The added store from bb1 exist at age 0
-///   - The added store from bb2 exist at age 0
+///   - Stores from bb0 exist with wait values of 1/2
+///   - The added store from bb1 exists with a wait value of 0
+///   - The added store from bb2 exists with a wait value of 0
 TEST_F(AMDGPUGFX12EventTrackingTest, AsymetricalDiamond) {
   StringRef MIR = R"(
 name:            AsymetricalDiamond
@@ -599,7 +602,7 @@ body:             |
 ///
 /// The timeline will showcase how the value of a counter can be different from
 /// the content of the timeline.
-///   - The timeline will have all records at an age of 0.
+///   - The timeline will have all records with a wait value of 0.
 ///   - The counter will still be at 2.
 TEST_F(AMDGPUGFX12EventTrackingTest, AsymetricalDiamond2) {
   StringRef MIR = R"(
@@ -659,7 +662,7 @@ body:             |
 }
 
 /// Check that the count of a counter stops at its limit minus 1, while the
-/// timeline keeps growing and record ages keep increasing.
+/// timeline keeps growing and record wait values keep increasing.
 TEST_F(AMDGPUGFX12EventTrackingTest, CountCappedAtLimit) {
   StringRef MIR = R"(
 name:            CountCappedAtLimit
@@ -697,7 +700,7 @@ body:             |
   EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
 
   // Further events no longer increment the count, but are still recorded and
-  // still age the existing records.
+  // still increment the wait value of existing records.
   constexpr unsigned Extra = 5;
   for (unsigned I = 0; I < Extra; ++I)
     ET.record(Load, Ev);
@@ -708,9 +711,9 @@ body:             |
   {
     auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
     ASSERT_EQ(LoadCnt.size(), NumRecords);
-    EXPECT_EQ(LoadCnt.front().Age, NumRecords - 1);
-    EXPECT_EQ(LoadCnt.back().Age, 0u);
-    EXPECT_GT(LoadCnt.front().Age, LoadCnt.getCount());
+    EXPECT_EQ(LoadCnt.front().WaitValue, NumRecords - 1);
+    EXPECT_EQ(LoadCnt.back().WaitValue, 0u);
+    EXPECT_GT(LoadCnt.front().WaitValue, LoadCnt.getCount());
   }
 
   // Other counters are unaffected.
@@ -718,7 +721,7 @@ body:             |
   EXPECT_FALSE(ET.isCapped(AMDGPU::STORE_CNT));
 
   // A partial drain uncaps the counter and removes all records at or above the
-  // drained age.
+  // drained wait value.
   ET.drain(AMDGPU::LOAD_CNT, 3);
   EXPECT_FALSE(ET.isCapped(AMDGPU::LOAD_CNT));
   {
@@ -735,8 +738,8 @@ body:             |
 }
 
 /// Check that drainCappedRecords only acts on capped counters, removes exactly
-/// the records whose age is at or above the cap (Limit - 1), and leaves the
-/// count and the younger records untouched.
+/// the records whose wait value is at or above the cap (Limit - 1), and leaves
+/// the count and the younger records untouched.
 TEST_F(AMDGPUGFX12EventTrackingTest, DrainCappedRecords) {
   StringRef MIR = R"(
 name:            DrainCappedRecords
@@ -785,22 +788,23 @@ body:             |
     // The hardware counter stays saturated: the count is not lowered.
     EXPECT_EQ(LoadCnt.getCount(), Cap);
     ASSERT_EQ(LoadCnt.size(), Cap);
-    EXPECT_EQ(LoadCnt.front().Age, Cap - 1);
-    EXPECT_EQ(LoadCnt.back().Age, 0u);
+    EXPECT_EQ(LoadCnt.front().WaitValue, Cap - 1);
+    EXPECT_EQ(LoadCnt.back().WaitValue, 0u);
   }
 
   // Idempotent.
   ET.drainCappedRecords(AMDGPU::LOAD_CNT);
   EXPECT_EQ(TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT).size(), Cap);
 
-  // One more event ages the oldest record to the cap; it is removed again.
+  // One more event brings the oldest record's wait value to the cap; it is
+  // removed again.
   ET.record(Load, Ev);
-  EXPECT_EQ(TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT).front().Age, Cap);
+  EXPECT_EQ(TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT).front().WaitValue, Cap);
   ET.drainCappedRecords(AMDGPU::LOAD_CNT);
   {
     auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
     ASSERT_EQ(LoadCnt.size(), Cap);
-    EXPECT_EQ(LoadCnt.front().Age, Cap - 1);
+    EXPECT_EQ(LoadCnt.front().WaitValue, Cap - 1);
   }
 
   // Other counters are unaffected.

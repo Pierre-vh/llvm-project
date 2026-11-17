@@ -319,10 +319,11 @@ private:
   /// conservative waitcnt 0 instead.
   bool willNeedWaitZero(const State &S, InstCounterType T) const;
 
-  /// \returns the wait on \p T that guarantees completion of a record of age
-  /// \p Age: 0 if \p willNeedWaitZero returns true, else \p Age capped at the
-  /// counter limit - 1.
-  unsigned waitFor(const State &S, InstCounterType T, unsigned Age) const;
+  /// \returns the wait on \p T that guarantees completion of a record whose
+  /// wait value is \p WaitValue: 0 if \p willNeedWaitZero returns true, else
+  /// \p WaitValue capped at the counter limit - 1.
+  unsigned waitFor(const State &S, InstCounterType T,
+                   unsigned WaitValue) const;
 
   /// \returns true if waits on \p T (LOAD_CNT or DS_CNT) must be 0 because a
   /// flat access that may hit both VMEM and LDS is pending, and the target
@@ -1082,13 +1083,13 @@ void AMDGPUNewInsertWaitcnts::waitForMatchingRecords(
   if (CurWait == 0)
     return; // nothing we do here can tighten the wait.
 
-  // The timeline is sorted by descending age, so walking it in reverse visits
-  // the youngest records first. The first match has the minimum age, i.e. the
-  // strongest wait any match would need: stop there.
+  // The timeline is sorted by descending wait value, so walking it in reverse
+  // visits the youngest records first. The first match has the minimum wait
+  // value, i.e. the strongest wait any match would need: stop there.
   const bool WillNeedWaitZero = willNeedWaitZero(S, T);
   for (const EventTrackerRecord &R : reverse(S.ET.getTimeline(T))) {
     // Stop the visit if nothing we do here can tighten the wait.
-    if (!DrainAll && R.getAge() >= CurWait && !WillNeedWaitZero)
+    if (!DrainAll && R.getWaitValue() >= CurWait && !WillNeedWaitZero)
       return;
 
     if (!Pred(R))
@@ -1097,7 +1098,7 @@ void AMDGPUNewInsertWaitcnts::waitForMatchingRecords(
     if (DrainAll)
       W.add(T, 0);
     else
-      W.add(T, waitFor(S, T, R.getAge()));
+      W.add(T, waitFor(S, T, R.getWaitValue()));
     return;
   }
 }
@@ -1140,14 +1141,14 @@ bool AMDGPUNewInsertWaitcnts::willNeedWaitZero(const State &S,
 }
 
 unsigned AMDGPUNewInsertWaitcnts::waitFor(const State &S, InstCounterType T,
-                                          unsigned Age) const {
+                                          unsigned WaitValue) const {
   if (willNeedWaitZero(S, T))
     return 0;
 
   // If the counter has been maxed out, avoid overflow by waiting for
   // Limit - 1 instead.
   const AMDGPUInstCounter &IC = getCounter(T, InstCounters);
-  return IC.hasLimit() ? std::min(Age, IC.getLimit() - 1) : Age;
+  return IC.hasLimit() ? std::min(WaitValue, IC.getLimit() - 1) : WaitValue;
 }
 
 void AMDGPUNewInsertWaitcnts::walkBlock(

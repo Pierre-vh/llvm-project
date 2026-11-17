@@ -14,15 +14,15 @@
 ///
 ///   - \ref CounterInfo: constant per-counter description (events, limit).
 ///   - \ref EventTrackerRecord: a view of a (MachineInstr, SingleHWEvent) pair
-///     with an age. A wait N, where N is <= to the age of the record, guarantees that
-///     event has completed.
+///     with a wait value: the largest N such that waiting for the counter to
+///     reach N or lower guarantees that the event has completed.
 ///   - \ref EventTracker: per-MBB state; for each counter, a count and a
-///     timeline of records sorted by descending age. Driven by the client
-///     during an RPO dataflow analysis: \ref EventTracker::enterBlock merges
-///     predecessor state, \ref EventTracker::record appends new events and
-///     increments the age of all pre-existing events, and
-///     \ref EventTracker::drain removes events that are older than a given
-///     value.
+///     timeline of records sorted by descending wait value.
+///     Driven by the client during an RPO dataflow analysis:
+///     \ref EventTracker::enterBlock merges predecessor state,
+///     \ref EventTracker::record appends new events and increments the wait
+///     value of all pre-existing events, and \ref EventTracker::drain removes
+///     events that are guaranteed to have completed after a wait.
 ///
 /// This is a low-level API. It can be used directly for trivial waitcnt
 /// calculation (e.g. wait on a specific MI), but the typical usage is for
@@ -51,16 +51,23 @@ namespace et_detail {
 
 /// Storage structure for individual records of events in the EventTracker.
 struct RecordImpl {
-  RecordImpl(MachineInstr &MI, SingleHWEvent Kind, unsigned Age = 0)
-      : MI(&MI), Kind(Kind), Age(Age) {}
+  RecordImpl(MachineInstr &MI, SingleHWEvent Kind,
+             unsigned MaxWaitToComplete = 0)
+      : MI(&MI), Kind(Kind), MaxWaitToComplete(MaxWaitToComplete) {}
 
   bool operator==(const RecordImpl &Other) const {
-    return MI == Other.MI && Kind == Other.Kind && Age == Other.Age;
+    return MI == Other.MI && Kind == Other.Kind &&
+           MaxWaitToComplete == Other.MaxWaitToComplete;
   }
 
   MachineInstr *MI = nullptr;
   SingleHWEvent Kind;
-  unsigned Age = 0;
+
+  /// Largest wait value N such that waiting for the counter to reach N or
+  /// lower guarantees this event has completed. Equivalently, the number of
+  /// younger events of the same counter that may still be in flight.
+  /// Conservative across merged paths (the minimum is kept at joins).
+  unsigned MaxWaitToComplete = 0;
 };
 
 /// Storage structure for all information pertaining to one InstCounterType in
@@ -97,8 +104,10 @@ public:
   /// \returns the kind of record this is, as a \ref SingleHWEvent.
   SingleHWEvent getKind() const { return Record->Kind; }
 
-  /// \returns the age of this record.
-  uint32_t getAge() const { return Record->Age; }
+  /// \returns the largest wait value N such that waiting for the counter to
+  /// reach N or lower guarantees this record's event has completed.
+  /// Conservative across merged paths.
+  uint32_t getWaitValue() const { return Record->MaxWaitToComplete; }
 
   void print(raw_ostream &OS, bool PrintMI = true, unsigned Indent = 0) const;
 
@@ -170,7 +179,7 @@ public:
   ///
   /// Clears the current state and merges the state of the EventTrackers of
   /// predecessor MBBs. Records with the same identity (MachineInstr and
-  /// SingleHWEvent) are merged and only the lowest age is kept.
+  /// SingleHWEvent) are merged and only the lowest wait value is kept.
   /// Counts are merged by taking the maximum.
   ///
   /// \param EventTrackerGetter maps a MachineBasicBlock to its EventTracker.
@@ -194,7 +203,7 @@ public:
 
   /// Drains the timeline of \p T such that:
   /// - The \ref count of \p T is no higher than \p N.
-  /// - There are no records in the timeline with an age >= \p N.
+  /// - There are no records in the timeline with a wait value >= \p N.
   /// If \p N = 0, then \p T is no longer in the indeterminate state.
   void drain(InstCounterType T, unsigned N = 0);
 
@@ -218,12 +227,12 @@ public:
   /// \returns the set of pending HWEvents for \p T.
   HWEvents getPendingEvents(InstCounterType T) const;
 
-  /// Drain all records of \p T that have an age >= the cap of \p T.
+  /// Drain all records of \p T that have a wait value >= the cap of \p T.
   void drainCappedRecords(InstCounterType T);
 
   /// \returns the current timeline for \p T, which contains all known in-flight
   /// (not drained) records. The timeline is always sorted by descending
-  /// age.
+  /// wait value (oldest first).
   /// The returned iterators are invalidated whenever the timeline changes (e.g.
   /// \ref record, \ref drain, \ref enterBlock).
   iterator_range<TimelineIt> getTimeline(InstCounterType T) const;
@@ -233,7 +242,8 @@ public:
   bool isTimelineIdentical(InstCounterType T, const EventTracker &Other) const;
 
   /// \returns true if \p Other tracks the same state: for every counter, the
-  /// same count and the same timeline (records compared by MI, kind and age).
+  /// same count and the same timeline (records compared by MI, kind and wait
+  /// value).
   /// The tracked MBB is not compared.
   bool operator==(const EventTracker &Other) const;
 
@@ -260,7 +270,7 @@ private:
 
   bool isCapped(const CounterData &CD) const;
 
-  /// Orders records by descending age. Ties are broken by kind, then by
+  /// Orders records by descending wait value. Ties are broken by kind, then by
   /// parent MBB number, so that the order is deterministic.
   static bool compareRecords(const RecordImpl &A, const RecordImpl &B);
 
