@@ -13,8 +13,8 @@
 /// outstanding and how far back they are, but does not directly compute waits.
 ///
 ///   - \ref CounterInfo: constant per-counter description (events, limit).
-///   - \ref EventTrackerRecord: a (MachineInstr, SingleHWEvent) pair with a
-///     age. A wait N, where N is <= to the age of the record, guarantees that
+///   - \ref EventTrackerRecord: a view of a (MachineInstr, SingleHWEvent) pair
+///     with an age. A wait N, where N is <= to the age of the record, guarantees that
 ///     event has completed.
 ///   - \ref EventTracker: per-MBB state; for each counter, a count and a
 ///     timeline of records sorted by descending age. Driven by the client
@@ -38,69 +38,67 @@
 #include "AMDGPUHWEvents.h"
 #include "AMDGPUWaitcntUtils.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/iterator_range.h"
 
 namespace llvm {
 class raw_ostream;
 class MachineBasicBlock;
 
 namespace AMDGPU {
-namespace eventtracking {
+namespace et_detail {
 
-class EventTracker;
+/// Storage structure for individual records of events in the EventTracker.
+struct RecordImpl {
+  RecordImpl(MachineInstr &MI, SingleHWEvent Kind, unsigned Age = 0)
+      : MI(&MI), Kind(Kind), Age(Age) {}
 
-/// Represents a record within the \ref EventTracker's timeline
-/// for one \ref InstCounterType. A record is a pair of \ref MachineInstr
-/// and \ref SingleHWEvent with an age in the timeline.
-///
-/// The age is a conservative minimum estimate of *when* the event it
-/// represents occurred. It is used to emit a wait instruction that ensures the
-/// event has completed (e.g. Age = 2 means "wait 2" on the counter ensures
-/// completion of the event across all control-flow paths).
-///
-/// Two examples illustrate how the age works:
-///
-/// If we are iterating a single block where there are no records inherited from
-/// incoming basic blocks, then the age of a record is trivial: if there are
-/// N records, the oldest is at age N-1, while the youngest is at age 0.
-/// The age of each existing record increases whenever a new one is added.
-///
-/// However, if one record is carried into multiple successor blocks and merged
-/// later (e.g. in a diamond), then the divergence (the same record could be at
-/// a different age depending on the CFG path taken) is reconciled by merging
-/// the records with the same \ref MachineInstr and \ref SingleHWEvent into a
-/// single record whose age is the minimum across the predecessors.
-///
-/// The second example shows that the age is decoupled from a record's
-/// position in the timeline. For example, a timeline could have 4 records, 3
-/// of them at age 0 and the remaining one at age 1.
-///
-/// The primary motivation for this system is that we want the capability to
-/// determine what kind of waitcnt must be emitted for a given event (record) to
-/// complete. For example, let R be a record in the timeline of a counter T,
-/// then a "waitcnt_T N" (a "drain") where N is <= the age of R must be
-/// sufficient to guarantee that R has completed (and its results can be used).
-class EventTrackerRecord {
-public:
-  using IdentityTy = std::pair<MachineInstr *, SingleHWEvent::value_type>;
-
-  EventTrackerRecord(IdentityTy Ident, uint32_t Age = 0)
-      : EventTrackerRecord(Ident.first, SingleHWEvent::fromRaw(Ident.second),
-                           Age) {}
-
-  EventTrackerRecord(MachineInstr *MI, SingleHWEvent Kind, uint32_t Age = 0)
-      : MI(MI), Kind(Kind) {
-    setAge(Age);
+  bool operator==(const RecordImpl &Other) const {
+    return MI == Other.MI && Kind == Other.Kind && Age == Other.Age;
   }
 
+  MachineInstr *MI = nullptr;
+  SingleHWEvent Kind;
+  unsigned Age = 0;
+};
+
+/// Storage structure for all information pertaining to one InstCounterType in
+/// EventTracker.
+struct CounterData {
+  using TimelineTy = SmallVector<RecordImpl, 16>;
+
+  const AMDGPUInstCounter *IC = nullptr;
+
+  TimelineTy Timeline;
+
+  /// The current value of the counter. This is a max (upper bound) across
+  /// all possible execution paths at runtime. It cannot be inferred from the
+  /// Timeline alone and is thus a separate tracking domain.
+  uint32_t Count = 0;
+
+  /// Cached pending events. Updated when recording new events, recomputed
+  /// whenever events are removed.
+  HWEvents PendingEventsCache;
+
+  bool IsIndeterminate = false;
+};
+} // namespace et_detail
+
+/// A view into a record within the \ref EventTracker's timeline
+/// for one \ref InstCounterType.
+class EventTrackerRecord {
+public:
+  explicit EventTrackerRecord(const et_detail::RecordImpl &Record) : Record(&Record) {}
+
   /// \returns the MachineInstr that originated this record.
-  MachineInstr *getMI() const { return MI; }
+  MachineInstr *getMI() const { return Record->MI; }
 
   /// \returns the kind of record this is, as a \ref SingleHWEvent.
-  SingleHWEvent getKind() const { return Kind; }
+  SingleHWEvent getKind() const { return Record->Kind; }
 
   /// \returns the age of this record.
-  uint32_t getAge() const { return Age; }
+  uint32_t getAge() const { return Record->Age; }
 
   void print(raw_ostream &OS, bool PrintMI = true, unsigned Indent = 0) const;
 
@@ -108,36 +106,13 @@ public:
   LLVM_DUMP_METHOD void dump() const;
 #endif
 
-  /// \returns the "identity" of this record, which is a pair of its MI and HW
-  /// Event Kind.
-  IdentityTy getIdentity() const;
-
   bool operator==(const EventTrackerRecord &Other) const {
-    return MI == Other.MI && Kind == Other.Kind && Age == Other.Age;
+    return *Record == *Other.Record;
   }
 
 private:
-  friend class EventTracker;
-
-  /// Sets the age of this record to \p NewAge.
-  void setAge(uint32_t NewAge) {
-    Age = NewAge;
-    assert(Age == NewAge && "Age overflow!");
-  }
-
-  MachineInstr *MI;
-  SingleHWEvent Kind;
-  // Age should never exceed the uint8_t limit in normal circumstances, as
-  // most counter types use at most 6 bits to encode waitcnts. 16 bits is a
-  // very generous limit; we can probably shrink it once we refine how we
-  // handle overflowing inst counters.
-  uint16_t Age;
+  const et_detail::RecordImpl *Record = nullptr;
 };
-
-/// This assert serves as a reminder to be mindful of the size of the object.
-static_assert(sizeof(EventTrackerRecord) == 16,
-              "EventTrackerRecord should remain small to optimize its layout "
-              "within cache lines, for maximum iteration speed");
 
 /// Per-MBB tracking context which tracks the current value (count) of each
 /// instruction counter and the timeline of \ref EventTrackerRecord
@@ -165,7 +140,21 @@ static_assert(sizeof(EventTrackerRecord) == 16,
 /// is its own predecessor) and call \ref EventTracker::enterBlock again, which
 /// clears the state and re-imports all incoming state.
 class EventTracker {
+  using RecordImpl = et_detail::RecordImpl;
+  using CounterData = et_detail::CounterData;
+  using RecordIdentity = std::pair<MachineInstr *, SingleHWEvent>;
+
+  struct EventTrackerRecordMapper {
+    EventTrackerRecord operator()(const RecordImpl &RI) const {
+      return EventTrackerRecord(RI);
+    }
+  };
+
 public:
+  using TimelineIt =
+      mapped_iterator<CounterData::TimelineTy::const_iterator,
+                      EventTrackerRecordMapper>;
+
   using GetEventTrackerFn =
       function_ref<EventTracker &(const MachineBasicBlock &)>;
 
@@ -180,8 +169,8 @@ public:
   /// Prepare this EventTracker for iteration through its basic block.
   ///
   /// Clears the current state and merges the state of the EventTrackers of
-  /// predecessor MBBs. Records are merged using their identity (see
-  /// \ref EventTrackerRecord::getIdentity) and only the lowest age is kept.
+  /// predecessor MBBs. Records with the same identity (MachineInstr and
+  /// SingleHWEvent) are merged and only the lowest age is kept.
   /// Counts are merged by taking the maximum.
   ///
   /// \param EventTrackerGetter maps a MachineBasicBlock to its EventTracker.
@@ -235,9 +224,13 @@ public:
   /// \returns the current timeline for \p T, which contains all known in-flight
   /// (not drained) records. The timeline is always sorted by descending
   /// age.
-  /// The returned ArrayRef is invalidated whenever the timeline changes (e.g.
+  /// The returned iterators are invalidated whenever the timeline changes (e.g.
   /// \ref record, \ref drain, \ref enterBlock).
-  ArrayRef<EventTrackerRecord> getTimeline(InstCounterType T) const;
+  iterator_range<TimelineIt> getTimeline(InstCounterType T) const;
+
+  /// \returns true if the timeline of \p T is identical (same records, same
+  /// order) in this tracker and in \p Other.
+  bool isTimelineIdentical(InstCounterType T, const EventTracker &Other) const;
 
   /// \returns true if \p Other tracks the same state: for every counter, the
   /// same count and the same timeline (records compared by MI, kind and age).
@@ -263,44 +256,13 @@ public:
 #endif
 
 private:
-  /// FIXME: I do not think it is relevant to expose this class like we expose
-  /// \ref EventTrackerRecord at this time. However, if this becomes complex
-  /// enough, we could clean it up and expose it if it leads to a better API.
-  struct CounterData {
-    const AMDGPUInstCounter *IC = nullptr;
-
-    SmallVector<EventTrackerRecord, 16> Timeline;
-
-    /// The current value of the counter. This is a max (upper bound) across
-    /// all possible execution paths at runtime. It cannot be inferred from the
-    /// Timeline alone and is thus a separate tracking domain.
-    ///
-    /// FIXME: We shouldn't need it for correctness so perhaps it should be
-    /// removed entirely, or be marked as debug.
-    uint32_t Count = 0;
-
-    /// Cached pending events. Updated when recording new events, recomputed
-    /// whenever events are removed.
-    HWEvents PendingEventsCache;
-
-    bool IsIndeterminate = false;
-
-    // TODO: We could imagine storing the per-predecessor age for incoming
-    // events. We could achieve that by storing that as a map of ((ID, Pred),
-    // Age). This would allow identifying events that are "deep" in one
-    // branch but "shallow" in another, e.g. an event needing a waitcnt 1 for
-    // one pred, but a waitcnt 8 for another. Not sure if we can exploit that
-    // though?
-  };
-
   static HWEvents calcPendingEvents(const CounterData &CD);
 
   bool isCapped(const CounterData &CD) const;
 
   /// Orders records by descending age. Ties are broken by kind, then by
   /// parent MBB number, so that the order is deterministic.
-  static bool compareRecords(const EventTrackerRecord &A,
-                             const EventTrackerRecord &B);
+  static bool compareRecords(const RecordImpl &A, const RecordImpl &B);
 
   /// Clears the tracked data, used when entering a block.
   void clear();
@@ -320,7 +282,6 @@ private:
   SmallVector<CounterData, InstCounterType::NUM_INST_CNTS> Counters;
 };
 
-} // namespace eventtracking
 } // namespace AMDGPU
 
 } // namespace llvm

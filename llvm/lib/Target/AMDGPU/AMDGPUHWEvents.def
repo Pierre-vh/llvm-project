@@ -26,6 +26,8 @@ AMDGPU_HW_EVENT(VMEM_INV_ACCESS,            3)  /* GLOBAL_INV/BUFFER_INV */
 AMDGPU_HW_EVENT(VMEM_WRITE_ACCESS,          4)  /* vmem write that is not scratch */
 AMDGPU_HW_EVENT(SCRATCH_WRITE_ACCESS,       5)  /* vmwrite that may be scratch */
 AMDGPU_HW_EVENT(VMEM_GROUP,                 6)  /* vmem group */
+// FIXME: Split into write+read, so we can avoid walking the timeline if no
+// writes are pending.
 AMDGPU_HW_EVENT(LDS_ACCESS,                 7)  /* lds read & write */
 AMDGPU_HW_EVENT(GDS_ACCESS,                 8)  /* gds read & write */
 AMDGPU_HW_EVENT(SQ_MESSAGE,                 9)  /* send message */

@@ -36,7 +36,6 @@
 
 using namespace llvm;
 using namespace llvm::AMDGPU;
-using namespace llvm::AMDGPU::eventtracking;
 
 #define DEBUG_TYPE "amdgpu-new-insert-waitcnts"
 #define PASS_NAME "AMDGPU New Insert Waitcnts"
@@ -399,7 +398,7 @@ void AMDGPUNewInsertWaitcnts::solve(Solution &Sol) {
         InstCounterType T = IC.getType();
         // If the timeline is unchanged and only the counter grew, widen the
         // count to the cap.
-        if ((Old.ET.getTimeline(T) == New.ET.getTimeline(T)) &&
+        if (Old.ET.isTimelineIdentical(T, New.ET) &&
             (Old.ET.count(T) < New.ET.count(T))) {
           if (New.ET.widenCount(IC.getType()))
             ++NumCounterWidened;

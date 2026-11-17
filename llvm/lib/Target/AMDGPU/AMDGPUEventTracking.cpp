@@ -29,19 +29,15 @@ static cl::opt<bool> EventTrackerPrintAll(
 #endif
 
 namespace AMDGPU {
-namespace eventtracking {
 
 void EventTrackerRecord::print(raw_ostream &OS, bool PrintMI,
                                unsigned Indent) const {
-  OS.indent(Indent) << "Record Kind=" << Kind << " Age=" << Age << ": ";
-  if (PrintMI && MI)
-    OS << *MI;
+  OS.indent(Indent) << "Record Kind=" << getKind() << " Age=" << getAge()
+                    << ": ";
+  if (PrintMI && getMI())
+    OS << *getMI();
   else
-    OS << "MI@" << (void *)MI << '\n';
-}
-
-EventTrackerRecord::IdentityTy EventTrackerRecord::getIdentity() const {
-  return {MI, Kind.rawValue()};
+    OS << "MI@" << (void *)getMI() << '\n';
 }
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
@@ -95,7 +91,7 @@ void EventTracker::enterBlock(GetEventTrackerFn EventTrackerGetter) {
 void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
   LLVM_DEBUG(dbgs() << "[EventTracker] Recording " << Event << ": " << MI);
 
-  EventTrackerRecord Rec = EventTrackerRecord(&MI, Event);
+  RecordImpl Rec(MI, Event);
   [[maybe_unused]] bool FoundMatch = false;
   for (CounterData &CD : Counters) {
     if (!CD.IC || !CD.IC->getEvents().contains(Event))
@@ -118,8 +114,8 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
     //
     // All in all, this small loop is fine for now, but we can revisit it if
     // profiling data justifies the change.
-    for (auto &Live : CD.Timeline)
-      Live.setAge(Live.getAge() + 1);
+    for (RecordImpl &Live : CD.Timeline)
+      ++Live.Age;
 
     // NOTE: Unlike recordIncomings, we do not merge with a previous record that
     // has the same identity (MI+Kind). Having two such records is fine: one is
@@ -127,7 +123,7 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
     // iteration.
     CD.Timeline.push_back(Rec);
 
-    CD.PendingEventsCache |= Rec.getKind();
+    CD.PendingEventsCache |= Rec.Kind;
 
     LLVM_DEBUG(if (EventTrackerPrintAll) {
       dbgs().indent(2) << "Updated Timeline:\n";
@@ -166,10 +162,11 @@ void EventTracker::drain(InstCounterType T, unsigned N) {
   } else {
     CD.Count = std::min(CD.Count, N);
 
-    auto *RmIt = remove_if(CD.Timeline, [&](EventTrackerRecord &E) {
-      if (E.getAge() < N)
+    auto *RmIt = remove_if(CD.Timeline, [&](RecordImpl &R) {
+      if (R.Age < N)
         return false;
-      LLVM_DEBUG(dbgs() << "  | Removing "; E.print(dbgs()));
+      LLVM_DEBUG(dbgs() << "  | Removing ";
+                 EventTrackerRecord(R).print(dbgs()));
       return true;
     });
     CD.Timeline.erase(RmIt, CD.Timeline.end());
@@ -204,6 +201,13 @@ bool EventTracker::isIndeterminate(InstCounterType T) const {
   return Counters[T].IsIndeterminate;
 }
 
+bool EventTracker::isTimelineIdentical(InstCounterType T,
+                                       const EventTracker &Other) const {
+  assert(Counters.size() == Other.Counters.size());
+  assert(Counters[T].IC && Other.Counters[T].IC && "Counter is not tracked!");
+  return Counters[T].Timeline == Other.Counters[T].Timeline;
+}
+
 bool EventTracker::operator==(const EventTracker &Other) const {
   assert(Counters.size() == Other.Counters.size());
   // Timelines are kept sorted by compareRecords, which is a strict total order
@@ -235,8 +239,8 @@ void EventTracker::drainCappedRecords(InstCounterType T) {
   // early.
   unsigned NumAboveCap = 0;
   unsigned Cap = CD.IC->getLimit() - 1;
-  for (EventTrackerRecord &R : CD.Timeline) {
-    if (R.getAge() >= Cap)
+  for (const RecordImpl &R : CD.Timeline) {
+    if (R.Age >= Cap)
       ++NumAboveCap;
     else
       break;
@@ -248,9 +252,9 @@ void EventTracker::drainCappedRecords(InstCounterType T) {
   }
 }
 
-ArrayRef<EventTrackerRecord>
+iterator_range<EventTracker::TimelineIt>
 EventTracker::getTimeline(InstCounterType T) const {
-  return Counters[T].Timeline;
+  return map_range(Counters[T].Timeline, EventTrackerRecordMapper());
 }
 
 void EventTracker::print(raw_ostream &OS, InstCounterType T) const {
@@ -275,21 +279,22 @@ void EventTracker::verify() const {
     //    same age. `recordIncomings` merges based on identity, and `record`
     //    increments the age of all pre-existing records before inserting a
     //    new one.
-    DenseSet<std::pair<EventTrackerRecord::IdentityTy, unsigned>> RecIdentityCheck;
-    for (const EventTrackerRecord &E : C.Timeline) {
-      if (E.getAge() > C.Count && !isCapped(C)) {
+    DenseSet<std::pair<RecordIdentity, unsigned>> RecIdentityCheck;
+    for (const RecordImpl &CR : C.Timeline) {
+      EventTrackerRecord ETR(CR);
+      if (CR.Age > C.Count && !isCapped(C)) {
         OnError();
         dbgs() << "Concerning Record:";
-        E.print(dbgs());
+        ETR.print(dbgs());
         llvm_unreachable("record age is out of range");
       }
 
-      auto [It, Inserted] =
-          RecIdentityCheck.insert({E.getIdentity(), E.getAge()});
+      RecordIdentity CRIdent = {CR.MI, CR.Kind};
+      auto [It, Inserted] = RecIdentityCheck.insert({CRIdent, ETR.getAge()});
       if (!Inserted) {
         OnError();
         dbgs() << "Concerning Record:";
-        E.print(dbgs());
+        ETR.print(dbgs());
         llvm_unreachable("The timeline cannot have two records with the same "
                          "MachineInstr, Kind and Age at the same time!");
       }
@@ -348,8 +353,8 @@ LLVM_DUMP_METHOD void EventTracker::dump() const {
 
 HWEvents EventTracker::calcPendingEvents(const CounterData &CD) {
   HWEvents Res;
-  for (const EventTrackerRecord &R : CD.Timeline)
-    Res |= R.getKind();
+  for (const RecordImpl &R : CD.Timeline)
+    Res |= R.Kind;
   return Res;
 }
 
@@ -360,20 +365,19 @@ bool EventTracker::isCapped(const CounterData &CD) const {
   return (CD.Count + 1) >= CD.IC->getLimit();
 }
 
-bool EventTracker::compareRecords(const EventTrackerRecord &A,
-                                  const EventTrackerRecord &B) {
+bool EventTracker::compareRecords(const RecordImpl &A, const RecordImpl &B) {
   // Different age.
-  if (A.getAge() != B.getAge())
-    return A.getAge() > B.getAge();
+  if (A.Age != B.Age)
+    return A.Age > B.Age;
 
   // Same age but different kind.
-  unsigned AKindV = A.getKind().rawValue();
-  unsigned BKindV = B.getKind().rawValue();
+  unsigned AKindV = A.Kind.rawValue();
+  unsigned BKindV = B.Kind.rawValue();
   if (AKindV != BKindV)
     return AKindV > BKindV;
 
-  const MachineInstr *AMI = A.getMI();
-  const MachineInstr *BMI = B.getMI();
+  const MachineInstr *AMI = A.MI;
+  const MachineInstr *BMI = B.MI;
   if (AMI == BMI)
     return false;
 
@@ -412,7 +416,7 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
     if (!CData.IC)
       continue;
 
-    DenseMap<EventTrackerRecord::IdentityTy, unsigned> Acc;
+    DenseMap<RecordIdentity, unsigned> Acc;
 
     for (EventTracker *Pred : Preds) {
       auto &PredCData = Pred->Counters[CData.IC->getType()];
@@ -422,21 +426,21 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
 
       CData.IsIndeterminate |= PredCData.IsIndeterminate;
 
-      for (EventTrackerRecord &PredEntry : PredCData.Timeline) {
+      for (const RecordImpl &PredEntry : PredCData.Timeline) {
         // At a join, collapse records from all predecessors with the same
         // identity (MI+Kind) into a single record whose age is the minimum
         // across predecessors.
-        auto [It, Inserted] = Acc.try_emplace(
-            PredEntry.getIdentity(), PredEntry.getAge());
+        RecordIdentity Key = {PredEntry.MI, PredEntry.Kind};
+        auto [It, Inserted] = Acc.try_emplace(Key, PredEntry.Age);
         if (!Inserted) {
           auto &AccVal = It->second;
-          AccVal = std::min(AccVal, PredEntry.getAge());
+          AccVal = std::min(AccVal, PredEntry.Age);
         }
       }
     }
 
-    for (auto &[RecIdent, RecAge]: Acc)
-      CData.Timeline.emplace_back(RecIdent, RecAge);
+    for (auto &[RecIdent, RecAge] : Acc)
+      CData.Timeline.emplace_back(*RecIdent.first, RecIdent.second, RecAge);
 
     CData.PendingEventsCache = calcPendingEvents(CData);
 
@@ -459,13 +463,12 @@ void EventTracker::print(raw_ostream &OS, const CounterData &CD,
   OS.indent(Indent) << CD.IC->getName() << " (Count=" << CD.Count
                     << ", Timeline=" << CD.Timeline.size()
                     << ", Indeterminate=" << CD.IsIndeterminate << ")\n";
-  for (const EventTrackerRecord &E : CD.Timeline) {
+  for (const RecordImpl &CR : CD.Timeline) {
     OS.indent(Indent + 2);
-    E.print(OS);
+    EventTrackerRecord(CR).print(OS);
   }
 }
 
-} // namespace eventtracking
 } // namespace AMDGPU
 
 } // namespace llvm

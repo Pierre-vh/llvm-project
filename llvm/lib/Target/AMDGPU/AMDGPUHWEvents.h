@@ -9,6 +9,7 @@
 #ifndef LLVM_LIB_TARGET_AMDGPU_UTILS_AMDGPUHWEVENTS_H
 #define LLVM_LIB_TARGET_AMDGPU_UTILS_AMDGPUHWEVENTS_H
 
+#include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/bit.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/Support/Compiler.h"
@@ -211,6 +212,19 @@ HWEvents getEventsFor(const MachineInstr &Inst, const GCNSubtarget &ST,
                       bool IsExpertMode, bool TgSplit);
 
 } // namespace AMDGPU
+
+template <> struct DenseMapInfo<AMDGPU::SingleHWEvent> {
+  using ParentT = DenseMapInfo<AMDGPU::SingleHWEvent::value_type>;
+
+  static unsigned getHashValue(const AMDGPU::SingleHWEvent &Val) {
+    return ParentT::getHashValue(Val.rawValue());
+  }
+
+  static bool isEqual(const AMDGPU::SingleHWEvent &LHS,
+                      const AMDGPU::SingleHWEvent &RHS) {
+    return ParentT::isEqual(LHS.rawValue(), RHS.rawValue());
+  }
+};
 
 raw_ostream &operator<<(raw_ostream &OS, AMDGPU::HWEvents E);
 } // namespace llvm

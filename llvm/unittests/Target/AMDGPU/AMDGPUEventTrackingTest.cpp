@@ -6,20 +6,21 @@
 //
 //===----------------------------------------------------------------------===//
 
-
 // FIXME: Tests are extensively written by AI (at least all the new ones);
-//        Carefully review them!
+//        Carefully review them before publishing any of this upstream.
+//        Do not send a slop grenade!
 
 #include "AMDGPUEventTracking.h"
 #include "AMDGPUUnitTests.h"
 #include "AMDGPUWaitcntUtils.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "gtest/gtest.h"
 
 using namespace llvm;
 using namespace llvm::AMDGPU;
-using namespace llvm::AMDGPU::eventtracking;
 
 namespace {
 
@@ -68,43 +69,93 @@ public:
   DenseMap<const MachineBasicBlock *, std::unique_ptr<EventTracker>> Trackers;
 };
 
-namespace {
-
-/// Provides some helpers to declaratively check the state of the EventTracker
-/// for one counter. This provides helpers to check the general counter state
-/// (value, etc) but also allows iterating over the timeline from the oldest to
-/// the youngest element.
-///
-/// This makes the actual test cases clearer.
-struct TrackerRecordsChecker {
-  TrackerRecordsChecker(EventTracker &ET, InstCounterType T)
-      : ET(ET), T(T), Records(ET.getTimeline(T)) {}
-
-  unsigned getCount() { return ET.count(T); }
-
-  bool empty() { return Records.empty(); }
-
-  // Has no records and count is zero
-  bool unused() { return empty() && !getCount(); }
-
-  const EventTrackerRecord &cur() { return Records[CurElt]; }
-
-  /// Move to the next record.
-  /// \returns true on success, false if the end has been reached.
-  bool next() {
-    ++CurElt;
-    if (CurElt >= Records.size())
-      return false;
-    return true;
-  }
-
-  EventTracker &ET;
-  InstCounterType T;
-  ArrayRef<EventTrackerRecord> Records;
-  unsigned CurElt = 0;
+/// Copy of one timeline record. Unlike \ref EventTrackerRecord, it stays valid
+/// when the tracker is modified.
+struct RecordSnapshot {
+  MachineInstr *MI;
+  SingleHWEvent Kind;
+  unsigned Age;
 };
 
-} // namespace
+/// Expected state of one timeline record, for
+/// \ref TrackerRecordsChecker::hasRecords.
+struct ExpectedRecord {
+  unsigned Opcode;
+  unsigned Age;
+  /// If set, the parent block of the record's MachineInstr.
+  const MachineBasicBlock *Parent = nullptr;
+};
+
+/// Snapshot of the state of one counter of an \ref EventTracker, taken at
+/// construction. Allows declaratively checking the counter state and the
+/// timeline, from the oldest to the youngest record.
+///
+/// The snapshot does not reference the tracker, so it stays valid when the
+/// tracker is modified afterwards.
+class TrackerRecordsChecker {
+public:
+  TrackerRecordsChecker(const EventTracker &ET, InstCounterType T)
+      : Count(ET.count(T)) {
+    for (EventTrackerRecord R : ET.getTimeline(T))
+      Records.push_back({R.getMI(), R.getKind(), R.getAge()});
+  }
+
+  unsigned getCount() const { return Count; }
+
+  size_t size() const { return Records.size(); }
+  bool empty() const { return Records.empty(); }
+
+  /// Has no records and count is zero.
+  bool unused() const { return empty() && !getCount(); }
+
+  /// \returns the oldest record.
+  const RecordSnapshot &front() const { return Records.front(); }
+  /// \returns the youngest record.
+  const RecordSnapshot &back() const { return Records.back(); }
+
+  /// Checks that the timeline matches \p Expected exactly, in order (oldest
+  /// first). Use with EXPECT_TRUE/ASSERT_TRUE to get a readable diagnostic.
+  testing::AssertionResult hasRecords(ArrayRef<ExpectedRecord> Expected) const {
+    if (Records.size() != Expected.size()) {
+      testing::AssertionResult Res = testing::AssertionFailure();
+      Res << "expected " << Expected.size() << " records, got "
+          << Records.size() << ':';
+      for (const RecordSnapshot &R : Records)
+        Res << ' '
+            << describe(R.MI, R.MI->getOpcode(), R.Age, R.MI->getParent());
+      return Res;
+    }
+
+    for (auto [Idx, R, E] : enumerate(Records, Expected)) {
+      if (R.MI->getOpcode() == E.Opcode && R.Age == E.Age &&
+          (!E.Parent || R.MI->getParent() == E.Parent))
+        continue;
+      return testing::AssertionFailure()
+             << "record #" << Idx << ": expected "
+             << describe(R.MI, E.Opcode, E.Age, E.Parent) << ", got "
+             << describe(R.MI, R.MI->getOpcode(), R.Age, R.MI->getParent());
+    }
+    return testing::AssertionSuccess();
+  }
+
+private:
+  /// \returns "{OPCODE, age N[, bb.M]}". \p MI is only used to fetch the
+  /// opcode names.
+  static std::string describe(const MachineInstr *MI, unsigned Opcode,
+                              unsigned Age, const MachineBasicBlock *Parent) {
+    const TargetInstrInfo *TII = MI->getMF()->getSubtarget().getInstrInfo();
+    std::string Str;
+    raw_string_ostream OS(Str);
+    OS << '{' << TII->getName(Opcode) << ", age " << Age;
+    if (Parent)
+      OS << ", bb." << Parent->getNumber();
+    OS << '}';
+    return Str;
+  }
+
+  unsigned Count;
+  SmallVector<RecordSnapshot> Records;
+};
 
 /// Check trivial straight line counting.
 TEST_F(AMDGPUGFX12EventTrackingTest, BasicTimeline) {
@@ -129,30 +180,21 @@ body:             |
 
   auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
   EXPECT_EQ(LoadCnt.getCount(), 1u);
-  EXPECT_FALSE(LoadCnt.empty());
-  EXPECT_EQ(LoadCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
-  EXPECT_EQ(LoadCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(LoadCnt.next());
+  EXPECT_TRUE(LoadCnt.hasRecords({{AMDGPU::GLOBAL_LOAD_DWORD, 0}}));
 
   auto DsCnt = TrackerRecordsChecker(ET, AMDGPU::DS_CNT);
   EXPECT_EQ(DsCnt.getCount(), 1u);
-  EXPECT_FALSE(DsCnt.empty());
-  EXPECT_EQ(DsCnt.cur().getMI()->getOpcode(), AMDGPU::DS_READ_B32_gfx9);
-  EXPECT_EQ(DsCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(DsCnt.next());
+  EXPECT_TRUE(DsCnt.hasRecords({{AMDGPU::DS_READ_B32_gfx9, 0}}));
 
   auto ExpCnt = TrackerRecordsChecker(ET, AMDGPU::EXP_CNT);
   EXPECT_TRUE(ExpCnt.unused());
 
   auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
   EXPECT_EQ(StoreCnt.getCount(), 2u);
-  EXPECT_FALSE(StoreCnt.empty());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 1u);
-  EXPECT_TRUE(StoreCnt.next());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORDX2);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(StoreCnt.next());
+  EXPECT_TRUE(StoreCnt.hasRecords({
+      {AMDGPU::GLOBAL_STORE_DWORD, 1},
+      {AMDGPU::GLOBAL_STORE_DWORDX2, 0},
+  }));
 }
 
 /// Check partial and full drains of a counter.
@@ -187,26 +229,27 @@ body:             |
   {
     auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
     EXPECT_EQ(StoreCnt.getCount(), 2u);
-    EXPECT_FALSE(StoreCnt.empty());
-    EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(),
-              AMDGPU::GLOBAL_STORE_DWORDX2);
-    EXPECT_EQ(StoreCnt.cur().getAge(),
-              1u); // drain doesn't change record ages
-    EXPECT_TRUE(StoreCnt.next());
-    EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-    EXPECT_EQ(StoreCnt.cur().getAge(),
-              0u); // drain doesn't change record ages
-    EXPECT_FALSE(StoreCnt.next());
+    // Drain doesn't change record ages.
+    EXPECT_TRUE(StoreCnt.hasRecords({
+        {AMDGPU::GLOBAL_STORE_DWORDX2, 1},
+        {AMDGPU::GLOBAL_STORE_DWORD, 0},
+    }));
   }
 
   // Draining a counter does not affect other counters.
-  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), 1u);
-  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), 1u);
+  {
+    auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
+    EXPECT_EQ(LoadCnt.getCount(), 1u);
+    EXPECT_EQ(LoadCnt.size(), 1u);
+  }
 
   // Draining above the current count is a no-op.
   ET.drain(AMDGPU::STORE_CNT, 5);
-  EXPECT_EQ(ET.count(AMDGPU::STORE_CNT), 2u);
-  EXPECT_EQ(ET.getTimeline(AMDGPU::STORE_CNT).size(), 2u);
+  {
+    auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
+    EXPECT_EQ(StoreCnt.getCount(), 2u);
+    EXPECT_EQ(StoreCnt.size(), 2u);
+  }
 
   // Full drain.
   ET.drain(AMDGPU::STORE_CNT);
@@ -217,7 +260,7 @@ body:             |
 /// Check cases where a block loops back on itself.
 TEST_F(AMDGPUGFX12EventTrackingTest, SelfPredecessor) {
   StringRef MIR = R"(
-name:            BasicTimeline
+name:            SelfPredecessor
 body:             |
   bb.0:
     liveins: $vgpr1_vgpr2, $vgpr3_vgpr4, $vgpr4_vgpr5, $scc
@@ -233,7 +276,7 @@ body:             |
 ...
 )";
   ASSERT_TRUE(parseMIR(MIR));
-  MachineFunction &MF = getMF("BasicTimeline");
+  MachineFunction &MF = getMF("SelfPredecessor");
   MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
 
   // Iterate twice
@@ -242,36 +285,27 @@ body:             |
 
   auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
   EXPECT_EQ(LoadCnt.getCount(), 2u);
-  EXPECT_FALSE(LoadCnt.empty());
-  EXPECT_EQ(LoadCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
-  EXPECT_EQ(LoadCnt.cur().getAge(), 1u);
-  EXPECT_TRUE(LoadCnt.next());
-  EXPECT_EQ(LoadCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
-  EXPECT_EQ(LoadCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(LoadCnt.next());
+  EXPECT_TRUE(LoadCnt.hasRecords({
+      {AMDGPU::GLOBAL_LOAD_DWORD, 1},
+      {AMDGPU::GLOBAL_LOAD_DWORD, 0},
+  }));
 
   auto DsCnt = TrackerRecordsChecker(ET, AMDGPU::DS_CNT);
   EXPECT_EQ(DsCnt.getCount(), 2u);
-  EXPECT_FALSE(DsCnt.empty());
-  EXPECT_EQ(DsCnt.cur().getMI()->getOpcode(), AMDGPU::DS_READ_B32_gfx9);
-  EXPECT_EQ(DsCnt.cur().getAge(), 1u);
-  EXPECT_TRUE(DsCnt.next());
-  EXPECT_EQ(DsCnt.cur().getMI()->getOpcode(), AMDGPU::DS_READ_B32_gfx9);
-  EXPECT_EQ(DsCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(DsCnt.next());
+  EXPECT_TRUE(DsCnt.hasRecords({
+      {AMDGPU::DS_READ_B32_gfx9, 1},
+      {AMDGPU::DS_READ_B32_gfx9, 0},
+  }));
 
   auto ExpCnt = TrackerRecordsChecker(ET, AMDGPU::EXP_CNT);
   EXPECT_TRUE(ExpCnt.unused());
 
   auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
   EXPECT_EQ(StoreCnt.getCount(), 2u);
-  EXPECT_FALSE(StoreCnt.empty());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORDX2);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 1u);
-  EXPECT_TRUE(StoreCnt.next());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORDX2);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(StoreCnt.next());
+  EXPECT_TRUE(StoreCnt.hasRecords({
+      {AMDGPU::GLOBAL_STORE_DWORDX2, 1},
+      {AMDGPU::GLOBAL_STORE_DWORDX2, 0},
+  }));
 }
 
 /// Check all events carry into the next incoming block.
@@ -303,30 +337,21 @@ body:             |
 
   auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
   EXPECT_EQ(LoadCnt.getCount(), 1u);
-  EXPECT_FALSE(LoadCnt.empty());
-  EXPECT_EQ(LoadCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
-  EXPECT_EQ(LoadCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(LoadCnt.next());
+  EXPECT_TRUE(LoadCnt.hasRecords({{AMDGPU::GLOBAL_LOAD_DWORD, 0}}));
 
   auto DsCnt = TrackerRecordsChecker(ET, AMDGPU::DS_CNT);
   EXPECT_EQ(DsCnt.getCount(), 1u);
-  EXPECT_FALSE(DsCnt.empty());
-  EXPECT_EQ(DsCnt.cur().getMI()->getOpcode(), AMDGPU::DS_READ_B32_gfx9);
-  EXPECT_EQ(DsCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(DsCnt.next());
+  EXPECT_TRUE(DsCnt.hasRecords({{AMDGPU::DS_READ_B32_gfx9, 0}}));
 
   auto ExpCnt = TrackerRecordsChecker(ET, AMDGPU::EXP_CNT);
   EXPECT_TRUE(ExpCnt.unused());
 
   auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
   EXPECT_EQ(StoreCnt.getCount(), 2u);
-  EXPECT_FALSE(StoreCnt.empty());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 1u);
-  EXPECT_TRUE(StoreCnt.next());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORDX2);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(StoreCnt.next());
+  EXPECT_TRUE(StoreCnt.hasRecords({
+      {AMDGPU::GLOBAL_STORE_DWORD, 1},
+      {AMDGPU::GLOBAL_STORE_DWORDX2, 0},
+  }));
 }
 
 /// Check a simple merge where all events differ in each incoming block.
@@ -365,30 +390,21 @@ body:             |
 
   auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
   EXPECT_EQ(LoadCnt.getCount(), 1u);
-  EXPECT_FALSE(LoadCnt.empty());
-  EXPECT_EQ(LoadCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
-  EXPECT_EQ(LoadCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(LoadCnt.next());
+  EXPECT_TRUE(LoadCnt.hasRecords({{AMDGPU::GLOBAL_LOAD_DWORD, 0}}));
 
   auto DsCnt = TrackerRecordsChecker(ET, AMDGPU::DS_CNT);
   EXPECT_EQ(DsCnt.getCount(), 1u);
-  EXPECT_FALSE(DsCnt.empty());
-  EXPECT_EQ(DsCnt.cur().getMI()->getOpcode(), AMDGPU::DS_READ_B32_gfx9);
-  EXPECT_EQ(DsCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(DsCnt.next());
+  EXPECT_TRUE(DsCnt.hasRecords({{AMDGPU::DS_READ_B32_gfx9, 0}}));
 
   auto ExpCnt = TrackerRecordsChecker(ET, AMDGPU::EXP_CNT);
   EXPECT_TRUE(ExpCnt.unused());
 
   auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
   EXPECT_EQ(StoreCnt.getCount(), 2u);
-  EXPECT_FALSE(StoreCnt.empty());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 1u);
-  EXPECT_TRUE(StoreCnt.next());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORDX2);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(StoreCnt.next());
+  EXPECT_TRUE(StoreCnt.hasRecords({
+      {AMDGPU::GLOBAL_STORE_DWORD, 1},
+      {AMDGPU::GLOBAL_STORE_DWORDX2, 0},
+  }));
 }
 
 /// Merge with divergent events in a counter.
@@ -427,17 +443,11 @@ body:             |
 
   auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
   EXPECT_EQ(LoadCnt.getCount(), 1u);
-  EXPECT_FALSE(LoadCnt.empty());
-  EXPECT_EQ(LoadCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
-  EXPECT_EQ(LoadCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(LoadCnt.next());
+  EXPECT_TRUE(LoadCnt.hasRecords({{AMDGPU::GLOBAL_LOAD_DWORD, 0}}));
 
   auto DsCnt = TrackerRecordsChecker(ET, AMDGPU::DS_CNT);
   EXPECT_EQ(DsCnt.getCount(), 1u);
-  EXPECT_FALSE(DsCnt.empty());
-  EXPECT_EQ(DsCnt.cur().getMI()->getOpcode(), AMDGPU::DS_READ_B32_gfx9);
-  EXPECT_EQ(DsCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(DsCnt.next());
+  EXPECT_TRUE(DsCnt.hasRecords({{AMDGPU::DS_READ_B32_gfx9, 0}}));
 
   auto ExpCnt = TrackerRecordsChecker(ET, AMDGPU::EXP_CNT);
   EXPECT_TRUE(ExpCnt.unused());
@@ -445,15 +455,11 @@ body:             |
   auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
   // Count is 1 because we have 1 event max across all predecessors.
   EXPECT_EQ(StoreCnt.getCount(), 1u);
-  EXPECT_FALSE(StoreCnt.empty());
-  // First successor has GLOBAL_STORE_DWORD at age 0
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_TRUE(StoreCnt.next());
-  // Second successor has GLOBAL_STORE_DWORDX2 at age 0 too
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORDX2);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(StoreCnt.next());
+  // Each predecessor contributes its store at age 0.
+  EXPECT_TRUE(StoreCnt.hasRecords({
+      {AMDGPU::GLOBAL_STORE_DWORD, 0},   // From bb.0.
+      {AMDGPU::GLOBAL_STORE_DWORDX2, 0}, // From bb.1.
+  }));
 }
 
 /// Basic diamond CFG, the store is carried all the way into bb3 and uniqued
@@ -500,27 +506,18 @@ body:             |
 
   auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
   EXPECT_EQ(LoadCnt.getCount(), 1u);
-  EXPECT_FALSE(LoadCnt.empty());
-  EXPECT_EQ(LoadCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
-  EXPECT_EQ(LoadCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(LoadCnt.next());
+  EXPECT_TRUE(LoadCnt.hasRecords({{AMDGPU::GLOBAL_LOAD_DWORD, 0}}));
 
   auto DsCnt = TrackerRecordsChecker(ET, AMDGPU::DS_CNT);
   EXPECT_EQ(DsCnt.getCount(), 1u);
-  EXPECT_FALSE(DsCnt.empty());
-  EXPECT_EQ(DsCnt.cur().getMI()->getOpcode(), AMDGPU::DS_READ_B32_gfx9);
-  EXPECT_EQ(DsCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(DsCnt.next());
+  EXPECT_TRUE(DsCnt.hasRecords({{AMDGPU::DS_READ_B32_gfx9, 0}}));
 
   auto ExpCnt = TrackerRecordsChecker(ET, AMDGPU::EXP_CNT);
   EXPECT_TRUE(ExpCnt.unused());
 
   auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
   EXPECT_EQ(StoreCnt.getCount(), 1u);
-  EXPECT_FALSE(StoreCnt.empty());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(StoreCnt.next());
+  EXPECT_TRUE(StoreCnt.hasRecords({{AMDGPU::GLOBAL_STORE_DWORD, 0}}));
 }
 
 /// Asymetrical diamond
@@ -570,8 +567,9 @@ body:             |
 
   visitAll(BB0);
   visitAll(BB1);
-  visitAll(BB2,
-           /*AfterVisit=*/[&](EventTracker &ET) { ET.drain(STORE_CNT, 1); });
+  visitAll(
+      BB2,
+      /*AfterVisit=*/[&](EventTracker &ET) { ET.drain(AMDGPU::STORE_CNT, 1); });
   auto &ET = visitAll(BB3);
 
   auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
@@ -586,23 +584,12 @@ body:             |
   auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
 
   EXPECT_EQ(StoreCnt.getCount(), 3u);
-  EXPECT_FALSE(StoreCnt.empty());
-
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getMI()->getParent(), &BB0);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 2u);
-  EXPECT_TRUE(StoreCnt.next());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORDX2);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 1u);
-  EXPECT_TRUE(StoreCnt.next());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getMI()->getParent(), &BB1);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_TRUE(StoreCnt.next());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getMI()->getParent(), &BB2);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(StoreCnt.next());
+  EXPECT_TRUE(StoreCnt.hasRecords({
+      {AMDGPU::GLOBAL_STORE_DWORD, 2, &BB0},
+      {AMDGPU::GLOBAL_STORE_DWORDX2, 1},
+      {AMDGPU::GLOBAL_STORE_DWORD, 0, &BB1},
+      {AMDGPU::GLOBAL_STORE_DWORD, 0, &BB2},
+  }));
 }
 
 /// Asymetrical diamond
@@ -665,16 +652,10 @@ body:             |
   auto StoreCnt = TrackerRecordsChecker(ET, AMDGPU::STORE_CNT);
 
   EXPECT_EQ(StoreCnt.getCount(), 2u);
-  EXPECT_FALSE(StoreCnt.empty());
-
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getMI()->getParent(), &BB0);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_TRUE(StoreCnt.next());
-  EXPECT_EQ(StoreCnt.cur().getMI()->getOpcode(), AMDGPU::GLOBAL_STORE_DWORD);
-  EXPECT_EQ(StoreCnt.cur().getMI()->getParent(), &BB2);
-  EXPECT_EQ(StoreCnt.cur().getAge(), 0u);
-  EXPECT_FALSE(StoreCnt.next());
+  EXPECT_TRUE(StoreCnt.hasRecords({
+      {AMDGPU::GLOBAL_STORE_DWORD, 0, &BB0},
+      {AMDGPU::GLOBAL_STORE_DWORD, 0, &BB2},
+  }));
 }
 
 /// Check that the count of a counter stops at its limit minus 1, while the
@@ -696,19 +677,12 @@ body:             |
   MachineInstr &Load = BB0.front();
   ASSERT_EQ(Load.getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
 
-  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
-  auto Counters = getCounters(ST, /*IsExpertMode=*/false);
-  const AMDGPUInstCounter *LoadIC = nullptr;
-  for (const AMDGPUInstCounter &IC : Counters) {
-    if (IC.getType() == AMDGPU::LOAD_CNT)
-      LoadIC = &IC;
-  }
-  ASSERT_TRUE(LoadIC && LoadIC->hasLimit());
-  const unsigned Limit = LoadIC->getLimit();
-  ASSERT_GT(Limit, 1u);
-
-  EventTracker ET(BB0, Counters);
+  EventTracker &ET = TrackerGetter(BB0);
   ET.enterBlock(TrackerGetter);
+  const AMDGPUInstCounter &LoadIC = getCounter(AMDGPU::LOAD_CNT, Counters);
+  ASSERT_TRUE(LoadIC.hasLimit());
+  const unsigned Limit = LoadIC.getLimit();
+  ASSERT_GT(Limit, 1u);
   const SingleHWEvent Ev = SingleHWEvent::encode(HWEvents::VMEM_READ_ACCESS);
 
   // Fill the counter up to just before the cap.
@@ -731,11 +705,13 @@ body:             |
   EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
 
   const unsigned NumRecords = Limit - 1 + Extra;
-  ArrayRef<EventTrackerRecord> TL = ET.getTimeline(AMDGPU::LOAD_CNT);
-  ASSERT_EQ(TL.size(), NumRecords);
-  EXPECT_EQ(TL.front().getAge(), NumRecords - 1);
-  EXPECT_EQ(TL.back().getAge(), 0u);
-  EXPECT_GT(TL.front().getAge(), ET.count(AMDGPU::LOAD_CNT));
+  {
+    auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
+    ASSERT_EQ(LoadCnt.size(), NumRecords);
+    EXPECT_EQ(LoadCnt.front().Age, NumRecords - 1);
+    EXPECT_EQ(LoadCnt.back().Age, 0u);
+    EXPECT_GT(LoadCnt.front().Age, LoadCnt.getCount());
+  }
 
   // Other counters are unaffected.
   EXPECT_TRUE(TrackerRecordsChecker(ET, AMDGPU::STORE_CNT).unused());
@@ -744,9 +720,12 @@ body:             |
   // A partial drain uncaps the counter and removes all records at or above the
   // drained age.
   ET.drain(AMDGPU::LOAD_CNT, 3);
-  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), 3u);
   EXPECT_FALSE(ET.isCapped(AMDGPU::LOAD_CNT));
-  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), 3u);
+  {
+    auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
+    EXPECT_EQ(LoadCnt.getCount(), 3u);
+    EXPECT_EQ(LoadCnt.size(), 3u);
+  }
 
   // The counter can be capped again afterwards.
   for (unsigned I = 0; I < Limit; ++I)
@@ -774,14 +753,11 @@ body:             |
   MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
   MachineInstr &Load = BB0.front();
 
-  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
-  auto Counters = getCounters(ST, /*IsExpertMode=*/false);
+  EventTracker &ET = TrackerGetter(BB0);
+  ET.enterBlock(TrackerGetter);
   const unsigned Limit = getCounter(AMDGPU::LOAD_CNT, Counters).getLimit();
   const unsigned Cap = Limit - 1;
   ASSERT_GT(Limit, 2u);
-
-  EventTracker ET(BB0, Counters);
-  ET.enterBlock(TrackerGetter);
   const SingleHWEvent Ev = SingleHWEvent::encode(HWEvents::VMEM_READ_ACCESS);
 
   // Not capped: nothing is removed.
@@ -789,36 +765,43 @@ body:             |
     ET.record(Load, Ev);
   ASSERT_FALSE(ET.isCapped(AMDGPU::LOAD_CNT));
   ET.drainCappedRecords(AMDGPU::LOAD_CNT);
-  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), 3u);
-  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), 3u);
+  {
+    auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
+    EXPECT_EQ(LoadCnt.getCount(), 3u);
+    EXPECT_EQ(LoadCnt.size(), 3u);
+  }
 
   // Capped, with Extra records at or above the cap.
   constexpr unsigned Extra = 4;
   for (unsigned I = 3; I < Cap + Extra; ++I)
     ET.record(Load, Ev);
   ASSERT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
-  ASSERT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), Cap + Extra);
+  ASSERT_EQ(TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT).size(), Cap + Extra);
 
   ET.drainCappedRecords(AMDGPU::LOAD_CNT);
-  ArrayRef<EventTrackerRecord> TL = ET.getTimeline(AMDGPU::LOAD_CNT);
-  ASSERT_EQ(TL.size(), Cap);
-  EXPECT_EQ(TL.front().getAge(), Cap - 1);
-  EXPECT_EQ(TL.back().getAge(), 0u);
-  // The hardware counter stays saturated: the count is not lowered.
-  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Cap);
   EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
+  {
+    auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
+    // The hardware counter stays saturated: the count is not lowered.
+    EXPECT_EQ(LoadCnt.getCount(), Cap);
+    ASSERT_EQ(LoadCnt.size(), Cap);
+    EXPECT_EQ(LoadCnt.front().Age, Cap - 1);
+    EXPECT_EQ(LoadCnt.back().Age, 0u);
+  }
 
   // Idempotent.
   ET.drainCappedRecords(AMDGPU::LOAD_CNT);
-  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), Cap);
+  EXPECT_EQ(TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT).size(), Cap);
 
   // One more event ages the oldest record to the cap; it is removed again.
   ET.record(Load, Ev);
-  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).front().getAge(), Cap);
+  EXPECT_EQ(TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT).front().Age, Cap);
   ET.drainCappedRecords(AMDGPU::LOAD_CNT);
-  TL = ET.getTimeline(AMDGPU::LOAD_CNT);
-  EXPECT_EQ(TL.size(), Cap);
-  EXPECT_EQ(TL.front().getAge(), Cap - 1);
+  {
+    auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
+    ASSERT_EQ(LoadCnt.size(), Cap);
+    EXPECT_EQ(LoadCnt.front().Age, Cap - 1);
+  }
 
   // Other counters are unaffected.
   ET.drainCappedRecords(AMDGPU::STORE_CNT);
@@ -844,30 +827,33 @@ body:             |
   MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
   MachineInstr &Load = BB0.front();
 
-  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
-  auto Counters = getCounters(ST, /*IsExpertMode=*/false);
-  const unsigned Cap = getCounter(AMDGPU::LOAD_CNT, Counters).getLimit() - 1;
-
-  EventTracker ET(BB0, Counters);
+  EventTracker &ET = TrackerGetter(BB0);
   ET.enterBlock(TrackerGetter);
+  const unsigned Cap = getCounter(AMDGPU::LOAD_CNT, Counters).getLimit() - 1;
   const SingleHWEvent Ev = SingleHWEvent::encode(HWEvents::VMEM_READ_ACCESS);
   ET.record(Load, Ev);
   ET.record(Load, Ev);
   ASSERT_EQ(ET.count(AMDGPU::LOAD_CNT), 2u);
 
   EXPECT_TRUE(ET.widenCount(AMDGPU::LOAD_CNT));
-  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Cap);
   EXPECT_TRUE(ET.isCapped(AMDGPU::LOAD_CNT));
-  ArrayRef<EventTrackerRecord> TL = ET.getTimeline(AMDGPU::LOAD_CNT);
-  ASSERT_EQ(TL.size(), 2u);
-  EXPECT_EQ(TL[0].getAge(), 1u);
-  EXPECT_EQ(TL[1].getAge(), 0u);
+  {
+    auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
+    EXPECT_EQ(LoadCnt.getCount(), Cap);
+    EXPECT_TRUE(LoadCnt.hasRecords({
+        {AMDGPU::GLOBAL_LOAD_DWORD, 1},
+        {AMDGPU::GLOBAL_LOAD_DWORD, 0},
+    }));
+  }
 
   // Widening twice is a no-op; recording keeps the count at the cap.
   EXPECT_TRUE(ET.widenCount(AMDGPU::LOAD_CNT));
   ET.record(Load, Ev);
-  EXPECT_EQ(ET.count(AMDGPU::LOAD_CNT), Cap);
-  EXPECT_EQ(ET.getTimeline(AMDGPU::LOAD_CNT).size(), 3u);
+  {
+    auto LoadCnt = TrackerRecordsChecker(ET, AMDGPU::LOAD_CNT);
+    EXPECT_EQ(LoadCnt.getCount(), Cap);
+    EXPECT_EQ(LoadCnt.size(), 3u);
+  }
 
   // A drain still lowers a widened count.
   ET.drain(AMDGPU::LOAD_CNT, 1);
@@ -879,7 +865,6 @@ body:             |
   EXPECT_EQ(ET.count(AMDGPU::TENSOR_CNT), 0u);
 }
 
-namespace {
 /// Two loads in bb.0, then a diamond: bb.0 -> {bb.1, bb.2} -> bb.3.
 constexpr const char *DiamondMIR = R"(
 name:            Diamond
@@ -901,7 +886,6 @@ body:             |
     S_ENDPGM 0
 ...
 )";
-} // namespace
 
 /// markIndeterminate widens the count. A partial drain keeps the flag; only a
 /// drain to 0 clears it.
@@ -919,7 +903,7 @@ TEST_F(AMDGPUGFX12EventTrackingTest, IndeterminateAndDrain) {
   ET.markIndeterminate(AMDGPU::STORE_CNT);
   EXPECT_TRUE(ET.isIndeterminate(AMDGPU::STORE_CNT));
   EXPECT_EQ(ET.count(AMDGPU::STORE_CNT), Cap);
-  EXPECT_TRUE(ET.getTimeline(AMDGPU::STORE_CNT).empty());
+  EXPECT_TRUE(TrackerRecordsChecker(ET, AMDGPU::STORE_CNT).empty());
 
   ET.record(Load, SingleHWEvent::encode(HWEvents::VMEM_WRITE_ACCESS));
   EXPECT_EQ(ET.count(AMDGPU::STORE_CNT), Cap);
@@ -960,7 +944,7 @@ TEST_F(AMDGPUGFX12EventTrackingTest, PendingEventsCache) {
   ET1.enterBlock(TrackerGetter);
   EXPECT_EQ(ET1.getPendingEvents(AMDGPU::STORE_CNT),
             HWEvents::VMEM_WRITE_ACCESS);
-#ifndef NDEBUG
+#if !defined(NDEBUG) || defined(EXPENSIVE_CHECKS)
   ET.verify();
   ET1.verify();
 #endif
