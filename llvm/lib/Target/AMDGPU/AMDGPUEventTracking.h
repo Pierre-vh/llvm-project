@@ -96,7 +96,8 @@ struct CounterData {
 /// for one \ref InstCounterType.
 class EventTrackerRecord {
 public:
-  explicit EventTrackerRecord(const et_detail::RecordImpl &Record) : Record(&Record) {}
+  explicit EventTrackerRecord(const et_detail::RecordImpl &Record)
+      : Record(&Record) {}
 
   /// \returns the MachineInstr that originated this record.
   MachineInstr *getMI() const { return Record->MI; }
@@ -160,15 +161,13 @@ class EventTracker {
   };
 
 public:
-  using TimelineIt =
-      mapped_iterator<CounterData::TimelineTy::const_iterator,
-                      EventTrackerRecordMapper>;
+  using TimelineIt = mapped_iterator<CounterData::TimelineTy::const_iterator,
+                                     EventTrackerRecordMapper>;
 
   /// \p MBB is the MachineBasicBlock for this tracker.
-  /// \p CounterInfos describes the available \ref InstCounterType. It must
-  /// contain exactly one entry for each counter type in
-  /// [0, CounterInfos.size()), and must outlive this class as its elements are
-  /// stored by reference.
+  /// \p CounterInfos describes the available \ref InstCounterType. Counters
+  /// unavailable on the target can be omitted (the InstCounterType value does
+  /// not have to match the index in \p CounterInfos)
   EventTracker(const MachineBasicBlock &MBB,
                ArrayRef<AMDGPUInstCounter> CounterInfos);
 
@@ -245,10 +244,6 @@ public:
   /// The tracked MBB is not compared.
   bool operator==(const EventTracker &Other) const;
 
-  /// Prints a dump of the internal tracking state of this class for \p T to the
-  /// stream \p OS.
-  void print(raw_ostream &OS, InstCounterType T) const;
-
   /// Prints a dump of all internal tracking state of this class to the stream
   /// \p OS. If \p IgnoreEmpty is true, do not print counters with a count of 0.
   void print(raw_ostream &OS, bool IgnoreEmpty = false,
@@ -264,20 +259,11 @@ public:
 #endif
 
 private:
-  static HWEvents calcPendingEvents(const CounterData &CD);
-
   bool isCapped(const CounterData &CD) const;
-
-  /// Orders records by descending wait value. Ties are broken by kind, then by
-  /// parent MBB number, so that the order is deterministic.
-  static bool compareRecords(const RecordImpl &A, const RecordImpl &B);
 
   /// Import all records from the predecessor trackers in \p Preds and
   /// reconcile divergence at joins.
   void recordIncomings(ArrayRef<const EventTracker *> Preds);
-
-  static void print(raw_ostream &OS, const CounterData &CD,
-                    unsigned Indent = 0);
 
   const MachineBasicBlock *MBB;
 

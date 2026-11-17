@@ -19,6 +19,8 @@
 
 #define DEBUG_TYPE "amdgpu-event-tracking"
 
+using namespace llvm::AMDGPU::et_detail;
+
 namespace llvm {
 
 #ifndef NDEBUG
@@ -29,6 +31,56 @@ static cl::opt<bool> EventTrackerPrintAll(
 #endif
 
 namespace AMDGPU {
+
+namespace {
+/// Orders records by descending wait value. Ties are broken by kind, then by
+/// parent MBB number, so that the order is deterministic.
+static bool compareRecords(const RecordImpl &A, const RecordImpl &B) {
+  // Different wait value.
+  if (A.MaxWaitToComplete != B.MaxWaitToComplete)
+    return A.MaxWaitToComplete > B.MaxWaitToComplete;
+
+  // Same wait value but different kind.
+  unsigned AKindV = A.Kind.rawValue();
+  unsigned BKindV = B.Kind.rawValue();
+  if (AKindV != BKindV)
+    return AKindV > BKindV;
+
+  const MachineInstr *AMI = A.MI;
+  const MachineInstr *BMI = B.MI;
+  if (AMI == BMI)
+    return false;
+
+  // Same wait value/kind but MIs are in different MBBs: the one in the MBB with
+  // the lower number comes first.
+  const MachineBasicBlock *Bbb = BMI->getParent();
+  const MachineBasicBlock *Abb = AMI->getParent();
+  if (Abb != Bbb)
+    return Abb->getNumber() < Bbb->getNumber();
+
+  llvm_unreachable("We cannot have two distinct instructions from the same "
+                   "MBB, with the same wait value and the same event kind!");
+}
+
+static HWEvents calcPendingEvents(const CounterData &CD) {
+  HWEvents Res;
+  for (const RecordImpl &R : CD.Timeline)
+    Res |= R.Kind;
+  return Res;
+}
+
+static void printCounterData(raw_ostream &OS, const CounterData &CD,
+                         unsigned Indent = 0) {
+  OS.indent(Indent) << CD.IC->getName() << " (Count=" << CD.Count
+                    << ", Timeline=" << CD.Timeline.size()
+                    << ", Indeterminate=" << CD.IsIndeterminate << ")\n";
+  for (const RecordImpl &CR : CD.Timeline) {
+    OS.indent(Indent + 2);
+    EventTrackerRecord(CR).print(OS);
+  }
+}
+
+} // namespace
 
 void EventTrackerRecord::print(raw_ostream &OS, bool PrintMI,
                                unsigned Indent) const {
@@ -106,7 +158,7 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
 
     LLVM_DEBUG(if (EventTrackerPrintAll) {
       dbgs().indent(2) << "Updated Timeline:\n";
-      print(dbgs(), CD, /*Indent=*/4);
+      printCounterData(dbgs(), CD, /*Indent=*/4);
     });
   }
 
@@ -154,7 +206,7 @@ void EventTracker::drain(InstCounterType T, unsigned N) {
 
     LLVM_DEBUG(if (EventTrackerPrintAll) {
       dbgs().indent(2) << "Updated Timeline:\n";
-      print(dbgs(), CD, /*Indent=*/4);
+      printCounterData(dbgs(), CD, /*Indent=*/4);
     });
   }
 
@@ -236,10 +288,6 @@ EventTracker::getTimeline(InstCounterType T) const {
   return map_range(Counters[T].Timeline, EventTrackerRecordMapper());
 }
 
-void EventTracker::print(raw_ostream &OS, InstCounterType T) const {
-  print(OS, Counters[T]);
-}
-
 #if !defined(NDEBUG) || defined(EXPENSIVE_CHECKS)
 void EventTracker::verify() const {
   if (!MBB)
@@ -248,7 +296,7 @@ void EventTracker::verify() const {
   for (const CounterData &C : Counters) {
     const auto OnError = [&]() {
       dbgs() << "EventTracker verification error\n";
-      print(dbgs(), C);
+      printCounterData(dbgs(), C);
     };
 
     // Check some basic invariants:
@@ -320,7 +368,7 @@ void EventTracker::print(raw_ostream &OS, bool IgnoreEmpty,
   for (const CounterData &C : Counters) {
     if (!C.IC || (IgnoreEmpty && C.Count == 0))
       continue;
-    print(OS, C, Indent + 2);
+    printCounterData(OS, C, Indent + 2);
   }
 }
 
@@ -332,45 +380,11 @@ LLVM_DUMP_METHOD void EventTracker::dump() const {
 }
 #endif
 
-HWEvents EventTracker::calcPendingEvents(const CounterData &CD) {
-  HWEvents Res;
-  for (const RecordImpl &R : CD.Timeline)
-    Res |= R.Kind;
-  return Res;
-}
-
 bool EventTracker::isCapped(const CounterData &CD) const {
   if (!CD.IC || !CD.IC->hasLimit())
     return false;
   assert(CD.Count < CD.IC->getLimit() && "Counter already overflowed!");
   return (CD.Count + 1) >= CD.IC->getLimit();
-}
-
-bool EventTracker::compareRecords(const RecordImpl &A, const RecordImpl &B) {
-  // Different wait value.
-  if (A.MaxWaitToComplete != B.MaxWaitToComplete)
-    return A.MaxWaitToComplete > B.MaxWaitToComplete;
-
-  // Same wait value but different kind.
-  unsigned AKindV = A.Kind.rawValue();
-  unsigned BKindV = B.Kind.rawValue();
-  if (AKindV != BKindV)
-    return AKindV > BKindV;
-
-  const MachineInstr *AMI = A.MI;
-  const MachineInstr *BMI = B.MI;
-  if (AMI == BMI)
-    return false;
-
-  // Same wait value/kind but MIs are in different MBBs: the one in the MBB with
-  // the lower number comes first.
-  const MachineBasicBlock *Bbb = BMI->getParent();
-  const MachineBasicBlock *Abb = AMI->getParent();
-  if (Abb != Bbb)
-    return Abb->getNumber() < Bbb->getNumber();
-
-  llvm_unreachable("We cannot have two distinct instructions from the same "
-                   "MBB, with the same wait value and the same event kind!");
 }
 
 void EventTracker::recordIncomings(ArrayRef<const EventTracker *> Preds) {
@@ -405,8 +419,7 @@ void EventTracker::recordIncomings(ArrayRef<const EventTracker *> Preds) {
         // identity (MI+Kind) into a single record whose wait value is the
         // minimum across predecessors (i.e. the most conservative one).
         RecordIdentity Key = {PredEntry.MI, PredEntry.Kind};
-        auto [It, Inserted] =
-            Acc.try_emplace(Key, PredEntry.MaxWaitToComplete);
+        auto [It, Inserted] = Acc.try_emplace(Key, PredEntry.MaxWaitToComplete);
         if (!Inserted) {
           auto &AccVal = It->second;
           AccVal = std::min(AccVal, PredEntry.MaxWaitToComplete);
@@ -433,17 +446,6 @@ void EventTracker::recordIncomings(ArrayRef<const EventTracker *> Preds) {
     dbgs() << "[EventTracker] Timeline after recording incomings:\n";
     print(dbgs(), /*IgnoreEmpty=*/true, /*Indent=*/2);
   });
-}
-
-void EventTracker::print(raw_ostream &OS, const CounterData &CD,
-                         unsigned Indent) {
-  OS.indent(Indent) << CD.IC->getName() << " (Count=" << CD.Count
-                    << ", Timeline=" << CD.Timeline.size()
-                    << ", Indeterminate=" << CD.IsIndeterminate << ")\n";
-  for (const RecordImpl &CR : CD.Timeline) {
-    OS.indent(Indent + 2);
-    EventTrackerRecord(CR).print(OS);
-  }
 }
 
 } // namespace AMDGPU
