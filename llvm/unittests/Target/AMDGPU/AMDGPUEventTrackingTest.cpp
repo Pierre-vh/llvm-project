@@ -28,18 +28,29 @@ class AMDGPUGFX12EventTrackingTest : public AMDGPUCodeGenTestBase {
 public:
   void SetUp() override {
     setUpImpl("amdgpu12.00-amd-amdhsa", "", "");
+  }
 
-    TrackerGetter = [&](const MachineBasicBlock &MBB) -> EventTracker & {
-      const GCNSubtarget &ST = MBB.getParent()->getSubtarget<GCNSubtarget>();
-      // EventTracker stores pointers into the counter list, so it must outlive
-      // the trackers.
-      if (Counters.empty())
-        Counters = getCounters(ST, /*IsExpertMode=*/false);
-      auto &Entry = Trackers[&MBB];
-      if (!Entry)
-        Entry = std::make_unique<EventTracker>(MBB, Counters);
-      return *Entry;
-    };
+  /// \returns the tracker of \p MBB, creating it if needed.
+  EventTracker &getTracker(const MachineBasicBlock &MBB) {
+    const GCNSubtarget &ST = MBB.getParent()->getSubtarget<GCNSubtarget>();
+    // EventTracker stores pointers into the counter list, so it must outlive
+    // the trackers.
+    if (Counters.empty())
+      Counters = getCounters(ST, /*IsExpertMode=*/false);
+    auto &Entry = Trackers[&MBB];
+    if (!Entry)
+      Entry = std::make_unique<EventTracker>(MBB, Counters);
+    return *Entry;
+  }
+
+  /// \returns the tracker of \p MBB after entering it.
+  EventTracker &enterBlock(const MachineBasicBlock &MBB) {
+    EventTracker &ET = getTracker(MBB);
+    SmallVector<const EventTracker *, 4> Preds;
+    for (const MachineBasicBlock *P : MBB.predecessors())
+      Preds.push_back(&getTracker(*P));
+    ET.enterBlock(Preds);
+    return ET;
   }
 
   EventTracker &
@@ -47,8 +58,7 @@ public:
            function_ref<void(EventTracker &ET)> AfterVisit = nullptr) {
     const GCNSubtarget &ST = MBB.getParent()->getSubtarget<GCNSubtarget>();
 
-    EventTracker &ET = TrackerGetter(MBB);
-    ET.enterBlock(TrackerGetter);
+    EventTracker &ET = enterBlock(MBB);
     for (MachineInstr &MI : MBB) {
       HWEvents Events =
           getEventsFor(MI, ST, /*IsExpertMode=*/false, /*TgSplit=*/false);
@@ -65,7 +75,6 @@ public:
   }
 
   SmallVector<AMDGPUInstCounter, NUM_INST_CNTS> Counters;
-  std::function<EventTracker &(const MachineBasicBlock &)> TrackerGetter;
   DenseMap<const MachineBasicBlock *, std::unique_ptr<EventTracker>> Trackers;
 };
 
@@ -680,8 +689,7 @@ body:             |
   MachineInstr &Load = BB0.front();
   ASSERT_EQ(Load.getOpcode(), AMDGPU::GLOBAL_LOAD_DWORD);
 
-  EventTracker &ET = TrackerGetter(BB0);
-  ET.enterBlock(TrackerGetter);
+  EventTracker &ET = enterBlock(BB0);
   const AMDGPUInstCounter &LoadIC = getCounter(AMDGPU::LOAD_CNT, Counters);
   ASSERT_TRUE(LoadIC.hasLimit());
   const unsigned Limit = LoadIC.getLimit();
@@ -756,8 +764,7 @@ body:             |
   MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
   MachineInstr &Load = BB0.front();
 
-  EventTracker &ET = TrackerGetter(BB0);
-  ET.enterBlock(TrackerGetter);
+  EventTracker &ET = enterBlock(BB0);
   const unsigned Limit = getCounter(AMDGPU::LOAD_CNT, Counters).getLimit();
   const unsigned Cap = Limit - 1;
   ASSERT_GT(Limit, 2u);
@@ -831,8 +838,7 @@ body:             |
   MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
   MachineInstr &Load = BB0.front();
 
-  EventTracker &ET = TrackerGetter(BB0);
-  ET.enterBlock(TrackerGetter);
+  EventTracker &ET = enterBlock(BB0);
   const unsigned Cap = getCounter(AMDGPU::LOAD_CNT, Counters).getLimit() - 1;
   const SingleHWEvent Ev = SingleHWEvent::encode(HWEvents::VMEM_READ_ACCESS);
   ET.record(Load, Ev);
@@ -899,8 +905,7 @@ TEST_F(AMDGPUGFX12EventTrackingTest, IndeterminateAndDrain) {
   MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
   MachineInstr &Load = BB0.front();
 
-  EventTracker &ET = TrackerGetter(BB0);
-  ET.enterBlock(TrackerGetter);
+  EventTracker &ET = enterBlock(BB0);
   const unsigned Cap = getCounter(AMDGPU::STORE_CNT, Counters).getLimit() - 1;
 
   // Indeterminate with an empty timeline (e.g. unknown stores at entry).
@@ -929,8 +934,7 @@ TEST_F(AMDGPUGFX12EventTrackingTest, PendingEventsCache) {
   MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
   MachineInstr &Load = BB0.front();
 
-  EventTracker &ET = TrackerGetter(BB0);
-  ET.enterBlock(TrackerGetter);
+  EventTracker &ET = enterBlock(BB0);
   // STORE_CNT tracks two kinds; the MI does not matter to the tracker.
   ET.record(Load, SingleHWEvent::encode(HWEvents::SCRATCH_WRITE_ACCESS));
   ET.record(Load, SingleHWEvent::encode(HWEvents::VMEM_WRITE_ACCESS));
@@ -944,8 +948,7 @@ TEST_F(AMDGPUGFX12EventTrackingTest, PendingEventsCache) {
 
   // Join into bb.1 rebuilds the cache.
   MachineBasicBlock &BB1 = *MF.getBlockNumbered(1);
-  EventTracker &ET1 = TrackerGetter(BB1);
-  ET1.enterBlock(TrackerGetter);
+  EventTracker &ET1 = enterBlock(BB1);
   EXPECT_EQ(ET1.getPendingEvents(AMDGPU::STORE_CNT),
             HWEvents::VMEM_WRITE_ACCESS);
 #if !defined(NDEBUG) || defined(EXPENSIVE_CHECKS)
@@ -970,12 +973,12 @@ TEST_F(AMDGPUGFX12EventTrackingTest, IndeterminatePropagatesThroughJoin) {
   visitAll(BB2);
   EventTracker &ET3 = visitAll(BB3);
 
-  EXPECT_FALSE(TrackerGetter(BB2).isIndeterminate(AMDGPU::STORE_CNT));
+  EXPECT_FALSE(getTracker(BB2).isIndeterminate(AMDGPU::STORE_CNT));
   EXPECT_TRUE(ET3.isIndeterminate(AMDGPU::STORE_CNT));
   EXPECT_FALSE(ET3.isIndeterminate(AMDGPU::LOAD_CNT));
   // Count is the max over predecessors: the widened one.
   EXPECT_EQ(ET3.count(AMDGPU::STORE_CNT),
-            TrackerGetter(BB1).count(AMDGPU::STORE_CNT));
+            getTracker(BB1).count(AMDGPU::STORE_CNT));
 
   // Two states that differ only by the flag are not equal.
   EventTracker A(BB1, Counters), B(BB1, Counters);

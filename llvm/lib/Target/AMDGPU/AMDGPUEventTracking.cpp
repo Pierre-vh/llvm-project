@@ -58,34 +58,12 @@ EventTracker::EventTracker(const MachineBasicBlock &MBB,
     Counters[IC.getType()].IC = &IC;
 }
 
-void EventTracker::enterBlock(GetEventTrackerFn EventTrackerGetter) {
+void EventTracker::enterBlock(ArrayRef<const EventTracker *> Preds) {
   LLVM_DEBUG(dbgs() << "\n[EventTracker] Entering ";
              MBB->printAsOperand(dbgs()); dbgs() << '\n');
-
-  // FIXME: This is a bit hacky, but we need to save the old state in case the
-  // MBB is also its own predecessor. Revisit when the design and clients of
-  // this class are set in stone.
-
-  SmallVector<EventTracker *> Preds;
-  bool IsSelfPred = false;
-  if (!MBB->pred_empty()) {
-    for (MachineBasicBlock *Pred : MBB->predecessors()) {
-      if (Pred == MBB)
-        IsSelfPred = true;
-      else
-        Preds.push_back(&EventTrackerGetter(*Pred));
-    }
-  }
-
-  if (IsSelfPred) {
-    EventTracker SelfCopy = *this;
-    Preds.push_back(&SelfCopy);
-    clear();
-    recordIncomings(Preds);
-  } else {
-    clear();
-    recordIncomings(Preds);
-  }
+  assert(Preds.size() == MBB->pred_size() &&
+         "Expected one tracker per predecessor");
+  recordIncomings(Preds);
 }
 
 void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
@@ -395,34 +373,27 @@ bool EventTracker::compareRecords(const RecordImpl &A, const RecordImpl &B) {
                    "MBB, with the same wait value and the same event kind!");
 }
 
-void EventTracker::clear() {
-  for (CounterData &C : Counters) {
-    C.Timeline.clear();
-    C.Count = 0;
-    C.IsIndeterminate = false;
-    C.PendingEventsCache = HWEvents();
-  }
-}
-
-void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
+void EventTracker::recordIncomings(ArrayRef<const EventTracker *> Preds) {
   LLVM_DEBUG(if (!Preds.empty()) {
     dbgs() << "[EventTracker] Recording incoming events (merge) from "
               "predecessors:\n";
-    for (EventTracker *Pred : Preds) {
+    for (const EventTracker *Pred : Preds) {
       Pred->print(dbgs(), /*IgnoreEmpty=*/true, /*Indent=*/2);
     }
   });
 
   // Iterate over all counters that are available to us.
-  for (CounterData &CData : Counters) {
-    assert(CData.Timeline.empty());
-    if (!CData.IC)
+  for (CounterData &OldCData : Counters) {
+    if (!OldCData.IC)
       continue;
 
+    // Build the merged state separately, as `this` may be one of the Preds.
+    CounterData CData;
+    CData.IC = OldCData.IC;
     DenseMap<RecordIdentity, unsigned> Acc;
 
-    for (EventTracker *Pred : Preds) {
-      auto &PredCData = Pred->Counters[CData.IC->getType()];
+    for (const EventTracker *Pred : Preds) {
+      const CounterData &PredCData = Pred->Counters[CData.IC->getType()];
 
       // The merged count is the max across predecessors.
       CData.Count = std::max(CData.Count, PredCData.Count);
@@ -450,6 +421,8 @@ void EventTracker::recordIncomings(ArrayRef<EventTracker *> Preds) {
 
     // Sort records by descending wait value for consistent iteration.
     stable_sort(CData.Timeline, compareRecords);
+
+    OldCData = std::move(CData);
   }
 
 #ifdef EXPENSIVE_CHECKS

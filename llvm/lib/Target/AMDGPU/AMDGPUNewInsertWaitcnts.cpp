@@ -1157,9 +1157,10 @@ void AMDGPUNewInsertWaitcnts::walkBlock(
     const DenseSet<const MachineBasicBlock *> &ForceDrain, Solution &Sol) {
   State &S = OutStates.at(&MBB);
 
-  S.ET.enterBlock(/*Getter=*/[&](auto &P) -> EventTracker & {
-    return OutStates.at(&P).ET;
-  });
+  SmallVector<const EventTracker *, 4> Preds;
+  for (const MachineBasicBlock *P : MBB.predecessors())
+    Preds.push_back(&OutStates.at(P).ET);
+  S.ET.enterBlock(Preds);
   // TODO: AsyncMark state join too
 
   bool IsEntryWithWaits = MBB.isEntryBlock() && EntryBlocksNeedWaits;

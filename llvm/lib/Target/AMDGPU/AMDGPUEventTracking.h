@@ -142,7 +142,7 @@ private:
 /// to query the current state of a counter, iterate its timeline, etc.
 ///
 /// Allocation/storage/mapping of EventTrackers to MBBs is left to the user of
-/// the class via \ref EventTracker::GetEventTrackerFn.
+/// the class.
 ///
 /// Whenever the dataflow analysis re-visits a block, the user of the class is
 /// expected to re-use the same EventTracker (which is required in case the MBB
@@ -164,9 +164,6 @@ public:
       mapped_iterator<CounterData::TimelineTy::const_iterator,
                       EventTrackerRecordMapper>;
 
-  using GetEventTrackerFn =
-      function_ref<EventTracker &(const MachineBasicBlock &)>;
-
   /// \p MBB is the MachineBasicBlock for this tracker.
   /// \p CounterInfos describes the available \ref InstCounterType. It must
   /// contain exactly one entry for each counter type in
@@ -182,8 +179,9 @@ public:
   /// SingleHWEvent) are merged and only the lowest wait value is kept.
   /// Counts are merged by taking the maximum.
   ///
-  /// \param EventTrackerGetter maps a MachineBasicBlock to its EventTracker.
-  void enterBlock(GetEventTrackerFn EventTrackerGetter);
+  /// \param Preds the EventTrackers of the predecessors of the MBB, in any
+  /// order. May contain this EventTracker if the MBB is its own predecessor.
+  void enterBlock(ArrayRef<const EventTracker *> Preds);
 
   /// Record an event of type \p Event at a MachineInstr \p MI, which will
   /// affect all counters that have \p Event in their event set.
@@ -274,12 +272,9 @@ private:
   /// parent MBB number, so that the order is deterministic.
   static bool compareRecords(const RecordImpl &A, const RecordImpl &B);
 
-  /// Clears the tracked data, used when entering a block.
-  void clear();
-
   /// Import all records from the predecessor trackers in \p Preds and
   /// reconcile divergence at joins.
-  void recordIncomings(ArrayRef<EventTracker *> Preds);
+  void recordIncomings(ArrayRef<const EventTracker *> Preds);
 
   static void print(raw_ostream &OS, const CounterData &CD,
                     unsigned Indent = 0);
