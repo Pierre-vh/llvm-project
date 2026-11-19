@@ -29,6 +29,21 @@
 /// clients to build helpers on top of it that combine the timeline with
 /// additional information (e.g. alias analysis, subtarget-specific behavior)
 /// to compute more precise waits.
+///
+/// TODO For Long Term:
+///   - Fix the `Counter` array, it's really not ideal. Find a cleaner way to
+///     store the counters, handling holes in the AMDGPUCounterInfo map.
+///     Possibilities are:
+///       - Avoid holes entirely (not nice)
+///       - Always reason with AMDGPUInstCounterInfo& instead of what we have
+///         now (part one, part other)
+///         Maybe in that case require the tracker to pass a MachineFunctionInfo
+///         or some kind of context object to enforce we always pass the right
+///         AMDGPUInstCounterInfo ptrs?
+///       - Keep vector dense, linear scan to find T
+///         - Tricky, handle differences in IC
+///       - Use unique_ptr in vector so holes don't matter
+///         - Need deep copy op which is ugly.
 //
 //===----------------------------------------------------------------------===//
 
@@ -75,6 +90,8 @@ struct RecordImpl {
 struct CounterData {
   using TimelineTy = SmallVector<RecordImpl, 16>;
 
+  /// Info about the counter. If nullptr, then this CounterData is invalid and
+  /// represents a counter not being tracked.
   const AMDGPUInstCounter *IC = nullptr;
 
   TimelineTy Timeline;
@@ -89,6 +106,8 @@ struct CounterData {
   HWEvents PendingEventsCache;
 
   bool IsIndeterminate = false;
+
+  bool isTracked() const { return IC != nullptr; }
 };
 } // namespace et_detail
 
@@ -267,10 +286,10 @@ private:
 
   const MachineBasicBlock *MBB;
 
-  // NB: This, combined with the inline storage of Timeline, can lead to this
-  // class becoming quite big - verify the size of this object whenever a change
-  // is made.
-  SmallVector<CounterData, InstCounterType::NUM_INST_CNTS> Counters;
+  /// FIXME?: We can have CounterDatas in there with a nullptr IC, which means
+  /// the counter is untracked. This wastes a bit of space but the added
+  /// complexity of worrying about that space isn't worth it.
+  SmallVector<CounterData, 0> Counters;
 };
 
 } // namespace AMDGPU

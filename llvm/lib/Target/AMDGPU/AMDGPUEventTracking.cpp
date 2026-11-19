@@ -70,7 +70,8 @@ static HWEvents calcPendingEvents(const CounterData &CD) {
 }
 
 static void printCounterData(raw_ostream &OS, const CounterData &CD,
-                         unsigned Indent = 0) {
+                             unsigned Indent = 0) {
+  assert(CD.isTracked());
   OS.indent(Indent) << CD.IC->getName() << " (Count=" << CD.Count
                     << ", Timeline=" << CD.Timeline.size()
                     << ", Indeterminate=" << CD.IsIndeterminate << ")\n";
@@ -124,7 +125,7 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
   RecordImpl Rec(MI, Event);
   [[maybe_unused]] bool FoundMatch = false;
   for (CounterData &CD : Counters) {
-    if (!CD.IC || !CD.IC->getEvents().contains(Event))
+    if (!CD.isTracked() || !CD.IC->getEvents().contains(Event))
       continue;
 
     FoundMatch = true;
@@ -171,7 +172,8 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
 
 bool EventTracker::widenCount(InstCounterType T) {
   CounterData &CD = Counters[T];
-  if (!CD.IC || !CD.IC->hasLimit())
+  assert(CD.isTracked());
+  if (!CD.IC->hasLimit())
     return false;
   LLVM_DEBUG(dbgs() << "[EventTracker] Widening " << CD.IC->getName() << "\n");
   CD.Count = CD.IC->getLimit() - 1;
@@ -181,6 +183,7 @@ bool EventTracker::widenCount(InstCounterType T) {
 
 void EventTracker::drain(InstCounterType T, unsigned N) {
   CounterData &CD = Counters[T];
+  assert(CD.isTracked());
   LLVM_DEBUG(dbgs() << "[EventTracker] Drain " << getInstCounterName(T)
                     << " at " << N << '\n');
 
@@ -219,8 +222,7 @@ void EventTracker::drain(InstCounterType T, unsigned N) {
 
 void EventTracker::markIndeterminate(InstCounterType T) {
   CounterData &CD = Counters[T];
-  if (!CD.IC)
-    return;
+  assert(CD.isTracked());
 
   LLVM_DEBUG(dbgs() << "[EventTracker] Marking as indeterminate: "
                     << CD.IC->getName() << "\n");
@@ -235,7 +237,8 @@ bool EventTracker::isIndeterminate(InstCounterType T) const {
 bool EventTracker::isTimelineIdentical(InstCounterType T,
                                        const EventTracker &Other) const {
   assert(Counters.size() == Other.Counters.size());
-  assert(Counters[T].IC && Other.Counters[T].IC && "Counter is not tracked!");
+  assert(Counters[T].isTracked());
+  assert(Counters[T].IC == Other.Counters[T].IC);
   return Counters[T].Timeline == Other.Counters[T].Timeline;
 }
 
@@ -263,6 +266,8 @@ HWEvents EventTracker::getPendingEvents(InstCounterType T) const {
 
 void EventTracker::drainCappedRecords(InstCounterType T) {
   CounterData &CD = Counters[T];
+  assert(CD.isTracked());
+
   if (!isCapped(CD))
     return;
 
@@ -294,6 +299,9 @@ void EventTracker::verify() const {
     llvm_unreachable("EventTracker has no MBB!");
 
   for (const CounterData &C : Counters) {
+    if (!C.isTracked())
+      continue;
+
     const auto OnError = [&]() {
       dbgs() << "EventTracker verification error\n";
       printCounterData(dbgs(), C);
@@ -366,7 +374,7 @@ void EventTracker::print(raw_ostream &OS, bool IgnoreEmpty,
 
   OS << '\n';
   for (const CounterData &C : Counters) {
-    if (!C.IC || (IgnoreEmpty && C.Count == 0))
+    if (!C.isTracked() || (IgnoreEmpty && C.Count == 0))
       continue;
     printCounterData(OS, C, Indent + 2);
   }
@@ -381,7 +389,8 @@ LLVM_DUMP_METHOD void EventTracker::dump() const {
 #endif
 
 bool EventTracker::isCapped(const CounterData &CD) const {
-  if (!CD.IC || !CD.IC->hasLimit())
+  assert(CD.isTracked());
+  if (!CD.IC->hasLimit())
     return false;
   assert(CD.Count < CD.IC->getLimit() && "Counter already overflowed!");
   return (CD.Count + 1) >= CD.IC->getLimit();
@@ -398,8 +407,13 @@ void EventTracker::recordIncomings(ArrayRef<const EventTracker *> Preds) {
 
   // Iterate over all counters that are available to us.
   for (CounterData &OldCData : Counters) {
-    if (!OldCData.IC)
+    if (!OldCData.isTracked()) {
+      for (const EventTracker *Pred : Preds) {
+        assert(Pred->Counters[OldCData.IC->getType()].isTracked() &&
+               "Counter is not tracked here but is tracked in incoming MBB!");
+      }
       continue;
+    }
 
     // Build the merged state separately, as `this` may be one of the Preds.
     CounterData CData;
@@ -408,6 +422,7 @@ void EventTracker::recordIncomings(ArrayRef<const EventTracker *> Preds) {
 
     for (const EventTracker *Pred : Preds) {
       const CounterData &PredCData = Pred->Counters[CData.IC->getType()];
+      assert(PredCData.IC == OldCData.IC);
 
       // The merged count is the max across predecessors.
       CData.Count = std::max(CData.Count, PredCData.Count);
