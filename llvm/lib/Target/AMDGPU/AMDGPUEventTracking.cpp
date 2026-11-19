@@ -408,10 +408,7 @@ void EventTracker::recordIncomings(ArrayRef<const EventTracker *> Preds) {
   // Iterate over all counters that are available to us.
   for (CounterData &OldCData : Counters) {
     if (!OldCData.isTracked()) {
-      for (const EventTracker *Pred : Preds) {
-        assert(Pred->Counters[OldCData.IC->getType()].isTracked() &&
-               "Counter is not tracked here but is tracked in incoming MBB!");
-      }
+      // FIXME: We should assert that the Preds also don't track this counter.
       continue;
     }
 

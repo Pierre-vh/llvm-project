@@ -1032,7 +1032,8 @@ void AMDGPUNewInsertWaitcnts::recordEvents(State &S, MachineInstr &MI) {
 void AMDGPUNewInsertWaitcnts::setStateOnFunctionEntryOrReturn(State &S) {
   // A caller (at function entry) or a callee (after a call) may leave stores in
   // flight that we don't track.
-  S.ET.markIndeterminate(STORE_CNT);
+  // FIXME: I think we should have a system like SmemCounter for STORE_CNT here.
+  S.ET.markIndeterminate(ST.hasVscnt() ? STORE_CNT : LOAD_CNT);
 }
 
 Waitcnt
