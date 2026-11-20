@@ -20,9 +20,14 @@
 ///     timeline of records sorted by descending wait value.
 ///     Driven by the client during an RPO dataflow analysis:
 ///     \ref EventTracker::enterBlock merges predecessor state,
-///     \ref EventTracker::record appends new events and increments the wait
-///     value of all pre-existing events, and \ref EventTracker::drain removes
-///     events that are guaranteed to have completed after a wait.
+///     \ref EventTracker::record appends new events (which implicitly ages
+///     all pre-existing events), and \ref EventTracker::drain removes events
+///     that are guaranteed to have completed after a wait.
+///
+/// Wait values are not stored directly. Each counter has a monotonic clock
+/// that ticks once per recorded event, and each record stores the clock value
+/// at which it was recorded (its stamp). The wait value of a record is
+/// `Clock - Stamp`, which makes \ref EventTracker::record O(1).
 ///
 /// This is a low-level API. It can be used directly for trivial waitcnt
 /// calculation (e.g. wait on a specific MI), but the typical usage is for
@@ -66,23 +71,16 @@ namespace et_detail {
 
 /// Storage structure for individual records of events in the EventTracker.
 struct RecordImpl {
-  RecordImpl(MachineInstr &MI, SingleHWEvent Kind,
-             unsigned MaxWaitToComplete = 0)
-      : MI(&MI), Kind(Kind), MaxWaitToComplete(MaxWaitToComplete) {}
-
-  bool operator==(const RecordImpl &Other) const {
-    return MI == Other.MI && Kind == Other.Kind &&
-           MaxWaitToComplete == Other.MaxWaitToComplete;
-  }
+  RecordImpl(MachineInstr &MI, SingleHWEvent Kind, uint32_t Stamp)
+      : MI(&MI), Kind(Kind), Stamp(Stamp) {}
 
   MachineInstr *MI = nullptr;
   SingleHWEvent Kind;
 
-  /// Largest wait value N such that waiting for the counter to reach N or
-  /// lower guarantees this event has completed. Equivalently, the number of
-  /// younger events of the same counter that may still be in flight.
-  /// Conservative across merged paths (the minimum is kept at joins).
-  unsigned MaxWaitToComplete = 0;
+  /// Value of the owning \ref CounterData::Clock when this record was
+  /// inserted. Only meaningful relative to that clock: see
+  /// \ref CounterData::waitOf.
+  uint32_t Stamp = 0;
 };
 
 /// Storage structure for all information pertaining to one InstCounterType in
@@ -101,6 +99,11 @@ struct CounterData {
   /// Timeline alone and is thus a separate tracking domain.
   uint32_t Count = 0;
 
+  /// Monotonic clock, incremented once per recorded event.
+  /// Unlike \ref Count, it is not clamped by drains or
+  /// widened, so the wait values of records can be derived from it.
+  uint32_t Clock = 0;
+
   /// Cached pending events. Updated when recording new events, recomputed
   /// whenever events are removed.
   HWEvents PendingEventsCache;
@@ -108,6 +111,12 @@ struct CounterData {
   bool IsIndeterminate = false;
 
   bool isTracked() const { return IC != nullptr; }
+
+  /// \returns the wait value of \p R, which must belong to this timeline:
+  uint32_t waitOf(const RecordImpl &R) const {
+    assert(R.Stamp <= Clock);
+    return Clock - R.Stamp;
+  }
 };
 } // namespace et_detail
 
@@ -115,8 +124,9 @@ struct CounterData {
 /// for one \ref InstCounterType.
 class EventTrackerRecord {
 public:
-  explicit EventTrackerRecord(const et_detail::RecordImpl &Record)
-      : Record(&Record) {}
+  EventTrackerRecord(const et_detail::RecordImpl &Record,
+                     const et_detail::CounterData &CD)
+      : Record(&Record), CD(&CD) {}
 
   /// \returns the MachineInstr that originated this record.
   MachineInstr *getMI() const { return Record->MI; }
@@ -127,7 +137,7 @@ public:
   /// \returns the largest wait value N such that waiting for the counter to
   /// reach N or lower guarantees this record's event has completed.
   /// Conservative across merged paths.
-  uint32_t getWaitValue() const { return Record->MaxWaitToComplete; }
+  uint32_t getWaitValue() const { return CD->waitOf(*Record); }
 
   void print(raw_ostream &OS, bool PrintMI = true, unsigned Indent = 0) const;
 
@@ -136,11 +146,14 @@ public:
 #endif
 
   bool operator==(const EventTrackerRecord &Other) const {
-    return *Record == *Other.Record;
+    return getMI() == Other.getMI() && getKind() == Other.getKind() &&
+           getWaitValue() == Other.getWaitValue();
   }
 
 private:
   const et_detail::RecordImpl *Record = nullptr;
+  /// Owning timeline, needed to derive the wait value.
+  const et_detail::CounterData *CD = nullptr;
 };
 
 /// Per-MBB tracking context which tracks the current value (count) of each
@@ -174,8 +187,9 @@ class EventTracker {
   using RecordIdentity = std::pair<MachineInstr *, SingleHWEvent>;
 
   struct EventTrackerRecordMapper {
+    const CounterData *CD = nullptr;
     EventTrackerRecord operator()(const RecordImpl &RI) const {
-      return EventTrackerRecord(RI);
+      return EventTrackerRecord(RI, *CD);
     }
   };
 

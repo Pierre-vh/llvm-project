@@ -875,6 +875,53 @@ body:             |
   EXPECT_EQ(ET.count(AMDGPU::TENSOR_CNT), 0u);
 }
 
+/// Equality compares derived wait values, not the internal clock/stamps: two
+/// trackers that reach the same timeline through different histories are
+/// equal.
+TEST_F(AMDGPUGFX12EventTrackingTest, EqualityIgnoresClock) {
+  StringRef MIR = R"(
+name:            EqualityIgnoresClock
+body:             |
+  bb.0:
+    liveins: $vgpr4_vgpr5, $vgpr6_vgpr7
+
+    $vgpr4 = GLOBAL_LOAD_DWORD $vgpr4_vgpr5, 0, 0, implicit $exec
+    $vgpr6 = GLOBAL_LOAD_DWORD $vgpr6_vgpr7, 0, 0, implicit $exec
+    S_ENDPGM 0
+...
+)";
+  ASSERT_TRUE(parseMIR(MIR));
+  MachineFunction &MF = getMF("EqualityIgnoresClock");
+  MachineBasicBlock &BB0 = *MF.getBlockNumbered(0);
+  MachineInstr &L1 = BB0.front();
+  MachineInstr &L2 = *std::next(BB0.begin());
+  const SingleHWEvent Ev = SingleHWEvent::encode(HWEvents::VMEM_READ_ACCESS);
+
+  // A: L1, L2, then drain L1 away.
+  EventTracker &A = enterBlock(BB0);
+  A.record(L1, Ev);
+  A.record(L2, Ev);
+  A.drain(AMDGPU::LOAD_CNT, 1);
+
+  // B: only L2.
+  EventTracker B(BB0, Counters);
+  B.record(L2, Ev);
+
+  EXPECT_TRUE(TrackerRecordsChecker(A, AMDGPU::LOAD_CNT)
+                  .hasRecords({{AMDGPU::GLOBAL_LOAD_DWORD, 0}}));
+  EXPECT_TRUE(A.isTimelineIdentical(AMDGPU::LOAD_CNT, B));
+  EXPECT_TRUE(A == B);
+
+  // Aging A's L2 record makes the trackers differ again.
+  A.record(L1, Ev);
+  EXPECT_FALSE(A.isTimelineIdentical(AMDGPU::LOAD_CNT, B));
+  EXPECT_FALSE(A == B);
+#if !defined(NDEBUG) || defined(EXPENSIVE_CHECKS)
+  A.verify();
+  B.verify();
+#endif
+}
+
 /// Two loads in bb.0, then a diamond: bb.0 -> {bb.1, bb.2} -> bb.3.
 constexpr const char *DiamondMIR = R"(
 name:            Diamond

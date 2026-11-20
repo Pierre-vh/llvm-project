@@ -16,6 +16,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
+#include <limits>
 
 #define DEBUG_TYPE "amdgpu-event-tracking"
 
@@ -33,12 +34,12 @@ static cl::opt<bool> EventTrackerPrintAll(
 namespace AMDGPU {
 
 namespace {
-/// Orders records by descending wait value. Ties are broken by kind, then by
-/// parent MBB number, so that the order is deterministic.
+/// Orders records of the same timeline by descending wait value (i.e.
+/// ascending stamp). Ties are broken by kind, then by parent MBB number, so
+/// that the order is deterministic.
 static bool compareRecords(const RecordImpl &A, const RecordImpl &B) {
-  // Different wait value.
-  if (A.MaxWaitToComplete != B.MaxWaitToComplete)
-    return A.MaxWaitToComplete > B.MaxWaitToComplete;
+  if (A.Stamp != B.Stamp)
+    return A.Stamp < B.Stamp;
 
   // Same wait value but different kind.
   unsigned AKindV = A.Kind.rawValue();
@@ -69,6 +70,17 @@ static HWEvents calcPendingEvents(const CounterData &CD) {
   return Res;
 }
 
+/// \returns true if \p A and \p B have the same records (MI, kind and wait
+/// value) in the same order. The clocks of the two timelines may differ and
+/// that is fine as the clock is just an implementation detail.
+static bool timelinesEqual(const CounterData &A, const CounterData &B) {
+  return equal(A.Timeline, B.Timeline,
+               [&](const RecordImpl &RA, const RecordImpl &RB) {
+                 return RA.MI == RB.MI && RA.Kind == RB.Kind &&
+                        A.waitOf(RA) == B.waitOf(RB);
+               });
+}
+
 static void printCounterData(raw_ostream &OS, const CounterData &CD,
                              unsigned Indent = 0) {
   assert(CD.isTracked());
@@ -77,7 +89,7 @@ static void printCounterData(raw_ostream &OS, const CounterData &CD,
                     << ", Indeterminate=" << CD.IsIndeterminate << ")\n";
   for (const RecordImpl &CR : CD.Timeline) {
     OS.indent(Indent + 2);
-    EventTrackerRecord(CR).print(OS);
+    EventTrackerRecord(CR, CD).print(OS);
   }
 }
 
@@ -122,7 +134,6 @@ void EventTracker::enterBlock(ArrayRef<const EventTracker *> Preds) {
 void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
   LLVM_DEBUG(dbgs() << "[EventTracker] Recording " << Event << ": " << MI);
 
-  RecordImpl Rec(MI, Event);
   [[maybe_unused]] bool FoundMatch = false;
   for (CounterData &CD : Counters) {
     if (!CD.isTracked() || !CD.IC->getEvents().contains(Event))
@@ -132,30 +143,18 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
     if (!isCapped(CD))
       ++CD.Count;
 
-    // NB: There is an intentional tradeoff here. We could avoid this loop by
-    // instead storing a timestamp in each record, and having a monotonically
-    // increasing clock to infer the wait value (clock - timestamp).
-    // However, it would:
-    //  - Complicate fetching the wait value (`EventTrackerRecord` could no
-    //    longer answer it on its own, and we would need a separate
-    //    query/wrapper).
-    //  - Make merging incoming records more annoying (we would need to rebase
-    //    the clock).
-    //  - Potentially require (much) more space in EventTrackerRecord to store
-    //    bigger numbers.
-    //
-    // All in all, this small loop is fine for now, but we can revisit it if
-    // profiling data justifies the change.
-    for (RecordImpl &Live : CD.Timeline)
-      ++Live.MaxWaitToComplete;
+    // Ticking the clock ages every pre-existing record by one.
+    assert(CD.Clock != std::numeric_limits<uint32_t>::max() &&
+           "Clock overflow");
+    ++CD.Clock;
 
     // NOTE: Unlike recordIncomings, we do not merge with a previous record that
     // has the same identity (MI+Kind). Having two such records is fine: one is
     // carried over from a backedge and the other is from a more recent
     // iteration.
-    CD.Timeline.push_back(Rec);
+    CD.Timeline.emplace_back(MI, Event, CD.Clock);
 
-    CD.PendingEventsCache |= Rec.Kind;
+    CD.PendingEventsCache |= Event;
 
     LLVM_DEBUG(if (EventTrackerPrintAll) {
       dbgs().indent(2) << "Updated Timeline:\n";
@@ -172,8 +171,7 @@ void EventTracker::record(MachineInstr &MI, SingleHWEvent Event) {
 
 bool EventTracker::widenCount(InstCounterType T) {
   CounterData &CD = Counters[T];
-  assert(CD.isTracked());
-  if (!CD.IC->hasLimit())
+  if (!CD.isTracked() || !CD.IC->hasLimit())
     return false;
   LLVM_DEBUG(dbgs() << "[EventTracker] Widening " << CD.IC->getName() << "\n");
   CD.Count = CD.IC->getLimit() - 1;
@@ -191,19 +189,22 @@ void EventTracker::drain(InstCounterType T, unsigned N) {
   if (N == 0) {
     CD.Timeline.clear();
     CD.Count = 0;
+    CD.Clock = 0;
 
     CD.IsIndeterminate = false;
   } else {
     CD.Count = std::min(CD.Count, N);
 
-    auto *RmIt = remove_if(CD.Timeline, [&](RecordImpl &R) {
-      if (R.MaxWaitToComplete < N)
-        return false;
-      LLVM_DEBUG(dbgs() << "  | Removing ";
-                 EventTrackerRecord(R).print(dbgs()));
-      return true;
-    });
-    CD.Timeline.erase(RmIt, CD.Timeline.end());
+    // The timeline is sorted by descending wait value, so the records to
+    // remove form a prefix.
+    auto *RmEnd = find_if(
+        CD.Timeline, [&](const RecordImpl &R) { return CD.waitOf(R) < N; });
+    LLVM_DEBUG(
+        for (const RecordImpl &R : make_range(CD.Timeline.begin(), RmEnd)) {
+          dbgs() << "  | Removing ";
+          EventTrackerRecord(R, CD).print(dbgs());
+        });
+    CD.Timeline.erase(CD.Timeline.begin(), RmEnd);
 
     LLVM_DEBUG(dbgs() << "  | => Updated Count:" << CD.Count << '\n');
 
@@ -239,7 +240,7 @@ bool EventTracker::isTimelineIdentical(InstCounterType T,
   assert(Counters.size() == Other.Counters.size());
   assert(Counters[T].isTracked());
   assert(Counters[T].IC == Other.Counters[T].IC);
-  return Counters[T].Timeline == Other.Counters[T].Timeline;
+  return timelinesEqual(Counters[T], Other.Counters[T]);
 }
 
 bool EventTracker::operator==(const EventTracker &Other) const {
@@ -249,7 +250,7 @@ bool EventTracker::operator==(const EventTracker &Other) const {
   // the same wait value), so an element-wise compare is exact.
   for (const auto &[A, B] : zip_equal(Counters, Other.Counters)) {
     assert(A.IC == B.IC && "comparing trackers with different counters");
-    if (A.Count != B.Count || A.Timeline != B.Timeline ||
+    if (A.Count != B.Count || !timelinesEqual(A, B) ||
         A.IsIndeterminate != B.IsIndeterminate)
       return false;
   }
@@ -276,7 +277,7 @@ void EventTracker::drainCappedRecords(InstCounterType T) {
   unsigned NumAboveCap = 0;
   unsigned Cap = CD.IC->getLimit() - 1;
   for (const RecordImpl &R : CD.Timeline) {
-    if (R.MaxWaitToComplete >= Cap)
+    if (CD.waitOf(R) >= Cap)
       ++NumAboveCap;
     else
       break;
@@ -290,7 +291,8 @@ void EventTracker::drainCappedRecords(InstCounterType T) {
 
 iterator_range<EventTracker::TimelineIt>
 EventTracker::getTimeline(InstCounterType T) const {
-  return map_range(Counters[T].Timeline, EventTrackerRecordMapper());
+  return map_range(Counters[T].Timeline,
+                   EventTrackerRecordMapper{&Counters[T]});
 }
 
 #if !defined(NDEBUG) || defined(EXPENSIVE_CHECKS)
@@ -308,6 +310,7 @@ void EventTracker::verify() const {
     };
 
     // Check some basic invariants:
+    //  - The stamp of a record cannot exceed the clock.
     //  - The wait value of a record cannot exceed the value of the counter.
     //  - We cannot have two records with the same identity and the same wait
     //    value, e.g. two VMEM_READ_ACCESS records for the same instruction
@@ -316,8 +319,15 @@ void EventTracker::verify() const {
     //    before inserting a new one.
     DenseSet<std::pair<RecordIdentity, unsigned>> RecIdentityCheck;
     for (const RecordImpl &CR : C.Timeline) {
-      EventTrackerRecord ETR(CR);
-      if (CR.MaxWaitToComplete > C.Count && !isCapped(C)) {
+      EventTrackerRecord ETR(CR, C);
+      if (CR.Stamp > C.Clock) {
+        OnError();
+        dbgs() << "Concerning Record: Stamp=" << CR.Stamp
+               << " Clock=" << C.Clock << '\n';
+        llvm_unreachable("record stamp is ahead of the clock");
+      }
+
+      if (C.waitOf(CR) > C.Count && !isCapped(C)) {
         OnError();
         dbgs() << "Concerning Record:";
         ETR.print(dbgs());
@@ -325,8 +335,7 @@ void EventTracker::verify() const {
       }
 
       RecordIdentity CRIdent = {CR.MI, CR.Kind};
-      auto [It, Inserted] =
-          RecIdentityCheck.insert({CRIdent, ETR.getWaitValue()});
+      auto [It, Inserted] = RecIdentityCheck.insert({CRIdent, CR.Stamp});
       if (!Inserted) {
         OnError();
         dbgs() << "Concerning Record:";
@@ -416,6 +425,8 @@ void EventTracker::recordIncomings(ArrayRef<const EventTracker *> Preds) {
     CounterData CData;
     CData.IC = OldCData.IC;
     DenseMap<RecordIdentity, unsigned> Acc;
+    // Upper bound of the merged wait values. Records are rebased on it below.
+    uint32_t LargestWait = 0;
 
     for (const EventTracker *Pred : Preds) {
       const CounterData &PredCData = Pred->Counters[CData.IC->getType()];
@@ -431,16 +442,24 @@ void EventTracker::recordIncomings(ArrayRef<const EventTracker *> Preds) {
         // identity (MI+Kind) into a single record whose wait value is the
         // minimum across predecessors (i.e. the most conservative one).
         RecordIdentity Key = {PredEntry.MI, PredEntry.Kind};
-        auto [It, Inserted] = Acc.try_emplace(Key, PredEntry.MaxWaitToComplete);
+        uint32_t Wait = PredCData.waitOf(PredEntry);
+        LargestWait = std::max(LargestWait, Wait);
+        auto [It, Inserted] = Acc.try_emplace(Key, Wait);
         if (!Inserted) {
           auto &AccVal = It->second;
-          AccVal = std::min(AccVal, PredEntry.MaxWaitToComplete);
+          AccVal = std::min(AccVal, Wait);
         }
       }
     }
 
-    for (auto &[RecIdent, RecWait] : Acc)
-      CData.Timeline.emplace_back(*RecIdent.first, RecIdent.second, RecWait);
+    // Rebase all records on a fresh clock. LargestWait is >= every merged
+    // wait value, so no stamp underflows. The oldest stamp is not necessarily
+    // 0 (the max is taken before the per-identity min), which is fine as
+    // stamps are only meaningful relative to the clock.
+    CData.Clock = LargestWait;
+    for (const auto &[RecIdent, RecWait] : Acc)
+      CData.Timeline.emplace_back(*RecIdent.first, RecIdent.second,
+                                  CData.Clock - RecWait);
 
     CData.PendingEventsCache = calcPendingEvents(CData);
 
