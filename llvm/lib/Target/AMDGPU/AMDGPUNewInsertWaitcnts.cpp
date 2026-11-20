@@ -926,8 +926,6 @@ bool AMDGPUNewInsertWaitcnts::isOutOfOrder(const State &S,
     Events -= HWEvents::VMEM_INV_ACCESS;
   }
 
-  // TODO(T6): an UNKNOWN_STORE record must count as mixed. Being a distinct
-  // kind, it should already do so here once it exists.
   return Events.size() > 1;
 }
 
@@ -1090,6 +1088,7 @@ void AMDGPUNewInsertWaitcnts::waitForMatchingRecords(
   const bool WillNeedWaitZero = willNeedWaitZero(S, T);
   for (const EventTrackerRecord &R : reverse(S.ET.getTimeline(T))) {
     // Stop the visit if nothing we do here can tighten the wait.
+    // FIXME: Claude says this is dead code? Does early exit ever trigger?
     if (!DrainAll && R.getWaitValue() >= CurWait && !WillNeedWaitZero)
       return;
 
